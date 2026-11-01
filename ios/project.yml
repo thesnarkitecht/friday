@@ -1,0 +1,25 @@
+# Generate the Xcode project with: brew install xcodegen && xcodegen
+name: Friday
+options:
+  bundleIdPrefix: com.example.friday
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Friday:
+    type: application
+    platform: iOS
+    sources: [Friday]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.friday
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: FRIDAY listens so it can answer you and remember what matters.
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Speech is transcribed on this iPhone before it is sent to your home server.
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: FRIDAY uses your location for local alerts, traffic and context.
+        INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription: FRIDAY watches for emergencies near you even when the app is closed.
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    info:
+      path: Friday/Info.plist
+      properties:
+        UIBackgroundModes: [audio, location]
+        LSApplicationQueriesSchemes: [shortcuts, tel, sms]
