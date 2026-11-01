@@ -80,17 +80,30 @@ def build(state):
         cams = await feeds.cameras_near(lat, lon)
         return {"cameras": [{k: c[k] for k in ("id", "name", "provider", "km")} for c in cams]}
 
+    async def describe(img, question):
+        msg = await state.llm.chat([{"role": "user", "content": [
+            {"type": "text", "text": question},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(img).decode()}}]}],
+            model=s.vision_model, max_tokens=200)
+        return msg.get("content")
+
     @t.tool("Look at a public traffic camera's latest frame and describe it.",
             camera_id=("string", "id from cameras_near"), question_=("string", "what to look for"))
     async def look_at_camera(camera_id, question="Describe traffic, weather and any incident in one sentence."):
         img = await feeds.frame(camera_id)
         if not img:
             return {"error": "no such camera"}
-        msg = await state.llm.chat([{"role": "user", "content": [
-            {"type": "text", "text": question},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(img).decode()}}]}],
-            model=s.vision_model, max_tokens=150)
-        return {"camera": camera_id, "sees": msg.get("content")}
+        return {"camera": camera_id, "sees": await describe(img, question)}
+
+    @t.tool("See what the owner is looking at through their Meta glasses camera and answer a question about it "
+            "(read a sign, identify a product or landmark, translate a menu).",
+            question=("string", "what the owner wants to know"))
+    async def look_through_glasses(question):
+        img = await state.glasses_frame()
+        if not img:
+            return {"error": "glasses camera unavailable (app closed, glasses off, or permission not granted)"}
+        rule = " Do not identify people by their face; describe them only in general terms."
+        return {"sees": await describe(img, question + rule)}
 
     @t.tool("Unread GitHub notifications.")
     async def github():

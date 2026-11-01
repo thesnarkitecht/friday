@@ -179,3 +179,24 @@ def test_tick_speaks_each_alert_once(tmp_path):
     asyncio.run(tick(state))
     asyncio.run(tick(state))
     assert said_log == ["Reminder: stand up", "Tornado warning", "GitHub: review requested on a/b: Fix"]
+
+
+def test_glasses_frame_round_trip(tmp_path):
+    llm = FakeLLM(
+        {"content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {
+            "name": "look_through_glasses", "arguments": json.dumps({"question": "What does the sign say?"})}}]},
+        "It says EXIT.",           # vision model
+        "The sign says exit.")     # final spoken reply
+    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws?token=secret") as ws:
+            ws.send_json({"type": "utterance", "text": "Friday, what does that sign say?"})
+            action = ws.receive_json()
+            assert action["kind"] == "glasses_frame"
+            r = c.post("/api/glasses/frame", json={"id": action["id"], "jpeg": "/9j/AAAA"},
+                       headers={"Authorization": "Bearer secret"})
+            assert r.json() == {"ok": True}
+            assert ws.receive_json() == {"type": "say", "text": "The sign says exit."}
+    vision_prompt = llm.sent[1][0]["content"]
+    assert vision_prompt[1]["image_url"]["url"].startswith("data:image/jpeg;base64,/9j/")
+    assert "Do not identify people" in vision_prompt[0]["text"]

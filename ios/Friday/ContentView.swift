@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var friday: Friday
+    @EnvironmentObject var glasses: Glasses
     @State private var typed = ""
     @State private var showSettings = false
 
@@ -19,6 +20,10 @@ struct ContentView: View {
                 .onTapGesture { friday.listening ? friday.stopListening() : friday.startListening() }
                 .accessibilityLabel(friday.listening ? "Listening. Tap to mute." : "Muted. Tap to listen.")
                 .accessibilityAddTraits(.isButton)
+            if let lens = glasses.previewView {
+                LensPreview(view: lens).frame(height: 120).clipShape(RoundedRectangle(cornerRadius: 12))
+                    .accessibilityLabel("Simulated glasses display")
+            }
             Text(friday.hearing.isEmpty ? " " : friday.hearing).font(.callout).foregroundStyle(.secondary).lineLimit(2)
             ScrollViewReader { proxy in
                 ScrollView {
@@ -59,8 +64,15 @@ struct Orb: View {
     }
 }
 
+struct LensPreview: UIViewRepresentable {
+    let view: UIView
+    func makeUIView(context: Context) -> UIView { view }
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var glasses: Glasses
     @State private var url = Settings.serverURL
     @State private var token = Settings.token
 
@@ -69,6 +81,11 @@ struct SettingsView: View {
             Form {
                 TextField("Home server URL", text: $url).textInputAutocapitalization(.never).keyboardType(.URL)
                 SecureField("Token", text: $token)
+                Section("Meta glasses") {
+                    Text(glasses.status).foregroundStyle(.secondary)
+                    Button("Connect glasses (opens Meta AI)") { Task { await glasses.register() } }
+                    Button("Simulate Ray-Ban Display (no hardware)") { glasses.simulate() }
+                }
             }
             .navigationTitle("Settings")
             .toolbar {

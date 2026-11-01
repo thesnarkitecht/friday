@@ -36,6 +36,7 @@ final class Friday: NSObject, ObservableObject {
         locations.startMonitoringSignificantLocationChanges()
         connect()
         startListening()
+        Task { await Glasses.shared.connect() }  // no-op wait if no glasses are registered
     }
 
     // MARK: link to the home box
@@ -80,8 +81,12 @@ final class Friday: NSObject, ObservableObject {
         switch msg["type"] as? String {
         case "say":
             lines.append(Line(who: "FRIDAY", text: text)); speak(text)
+            Task { await Glasses.shared.show(text) }
         case "notify":
             lines.append(Line(who: "FRIDAY", text: text)); speak(text); localNotification(text)
+            Task { await Glasses.shared.show(text) }
+        case "action" where msg["kind"] as? String == "glasses_frame":
+            if let id = msg["id"] as? String { Task { await sendGlassesFrame(id: id) } }
         case "action":
             // Apple-supported hand-offs only: Shortcuts, tel: and sms: all show the owner a system confirmation.
             if let s = msg["url"] as? String, let url = URL(string: s) {
@@ -93,6 +98,17 @@ final class Friday: NSObject, ObservableObject {
             }
         default: break
         }
+    }
+
+    private func sendGlassesFrame(id: String) async {
+        guard let jpg = await Glasses.shared.frame(), let url = URL(string: Settings.serverURL + "/api/glasses/frame")
+        else { return }  // the server times out and tells the model the camera was unavailable
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(Settings.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["id": id, "jpeg": jpg.base64EncodedString()])
+        _ = try? await URLSession.shared.data(for: req)
     }
 
     func type(_ text: String) {

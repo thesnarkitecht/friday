@@ -27,6 +27,8 @@ iPhone app ──(Tailscale, WebSocket)──► home server ──► model ser
 - **Calls people for you** through Twilio: it says it's an AI assistant, works toward the goal you gave it,
   and reports back.
 - **Looks at public traffic cameras** (NYC, London, California) and describes them with a vision model.
+- **Works with Meta glasses**: you talk and listen through them, replies show on the Ray-Ban Display lens, and
+  "what am I looking at?" uses the glasses camera. A built-in simulator covers testing without glasses.
 
 ## Run the server
 
@@ -80,3 +82,6 @@ It runs them by name.
 - The iOS app hasn't been compiled yet: it was written without Xcode.
 
 Traffic camera catalogs are ported from [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT).
+
+**Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list, the full feature list, iPhone
+testing steps, and the Meta glasses setup, including the simulator.

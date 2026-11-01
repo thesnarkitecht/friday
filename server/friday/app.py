@@ -1,6 +1,8 @@
 """FRIDAY home server. Run: uvicorn friday.app:app --host 0.0.0.0 --port 8080"""
 import asyncio
+import base64
 import hmac
+import uuid
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -44,7 +46,21 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
         sent = await broadcast({"type": "action", **action})
         return {"sent": bool(sent), **({} if sent else {"error": "FRIDAY app isn't connected"})}
 
-    state.notify, state.push_phone = notify, push_phone
+    async def glasses_frame(timeout=15):
+        """Ask the phone for one frame from the glasses camera; it answers via POST /api/glasses/frame."""
+        rid = uuid.uuid4().hex
+        state.glasses[rid] = asyncio.get_running_loop().create_future()
+        try:
+            if not await broadcast({"type": "action", "kind": "glasses_frame", "id": rid}):
+                return None
+            return await asyncio.wait_for(state.glasses[rid], timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            state.glasses.pop(rid, None)
+
+    state.glasses = {}
+    state.notify, state.push_phone, state.glasses_frame = notify, push_phone, glasses_frame
     state.calls = Calls(s, state.llm, state.memory, notify)
     state.brain = Brain(state.llm, state.memory, tools.build(state), s.owner)
 
@@ -118,6 +134,13 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
     async def location(body: dict):
         state.location = {"lat": float(body["lat"]), "lon": float(body["lon"]), "ts": time.time()}
         return {"ok": True}
+
+    @app.post("/api/glasses/frame", dependencies=[Depends(auth)])
+    async def glasses_frame_in(body: dict):
+        waiter = state.glasses.get(body.get("id"))
+        if waiter and not waiter.done():
+            waiter.set_result(base64.b64decode(body["jpeg"]))
+        return {"ok": waiter is not None}
 
     @app.get("/api/hud", dependencies=[Depends(auth)])
     async def hud():
