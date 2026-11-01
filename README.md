@@ -83,5 +83,7 @@ It runs them by name.
 
 Traffic camera catalogs are ported from [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT).
 
+**Preview (no devices needed):** `preview/friday-glasses.html` is a browser simulation of the Ray-Ban Display app, live at https://claude.ai/artifact/Lsa8d5RBMuLDfZxiGtzPGR (private to the owner until shared).
+
 **Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list, the full feature list, iPhone
 testing steps, and the Meta glasses setup, including the simulator.
