@@ -1,416 +1,519 @@
 <title>FRIDAY Lens</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Chakra+Petch:wght@400;500;600&display=swap">
 <style>
-/* Layout: the lens view is the hero (what your eye sees); a quiet console beside it drives FRIDAY. Single dark world on purpose: it's a heads-up display. */
+/* Layout: first-person stage (hero) beside the paired iPhone; slim console underneath.
+   Single dark world on purpose: you're wearing a heads-up display at night. */
 :root {
-  --bg: #0b0d10;
-  --panel: #12161b;
-  --line: #232a32;
-  --fg: #e8edf1;
-  --dim: #8b97a3;
-  --hud: #f2fbff;          /* light emitted by the waveguide */
-  --accent: #7fd6ff;       /* FRIDAY cyan */
-  --warn: #ffb547;
+  --bg: #07090c; --panel: #0f1318; --line: #1e262e; --fg: #e7eef3; --dim: #93a1ad;
+  --hud: #effaff; --cyan: #6fd8ff; --amber: #ffb547; --ios: #0a84ff;
   --font-ui: "Figtree", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-hud: "Chakra Petch", "Figtree", ui-monospace, monospace;
+  --font-ios: -apple-system, "SF Pro Text", "Figtree", system-ui, sans-serif;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  background: var(--bg); color: var(--fg); font: 15px/1.5 var(--font-ui);
-  padding-left: max(16px, env(safe-area-inset-left, 0px));
-  padding-right: max(16px, env(safe-area-inset-right, 0px));
-  padding-block: 20px;
-}
-.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 20px; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); align-items: start; }
-@media (max-width: 860px) { .wrap { grid-template-columns: minmax(0, 1fr); } }
-header { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
-h1 { margin: 0; font-size: 1.35rem; font-weight: 700; letter-spacing: .02em; text-wrap: balance; }
-h1 span { color: var(--accent); }
-.spec { font: 12px/1.4 var(--font-mono); color: var(--dim); letter-spacing: .04em; }
-
-/* ---- the view through the glasses ---- */
-.viewer { display: grid; gap: 10px; min-width: 0; }
-.scene { position: relative; aspect-ratio: 16 / 10; max-width: 100%; border-radius: 18px; overflow: hidden; background: #1a2230; border: 1px solid var(--line); }
-.scene canvas, .scene img.world { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.frame { position: absolute; inset: 0; pointer-events: none;
-  background:
-    radial-gradient(ellipse 30% 46% at 27% 52%, transparent 96%, rgba(0,0,0,.55) 100%),
-    radial-gradient(ellipse 30% 46% at 73% 52%, transparent 96%, rgba(0,0,0,.55) 100%);
-}
-.frame::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 9%; background: linear-gradient(#000c, transparent); }
-/* Display sits in the right lens, slightly below center (~20° field of view). */
-.lens { position: absolute; left: 73%; top: 55%; width: 33%; aspect-ratio: 1; transform: translate(-50%, -50%); }
-.display { position: absolute; inset: 0; width: 600px; height: 600px; transform-origin: 0 0; font-family: var(--font-ui); color: var(--hud); }
-.through .display { mix-blend-mode: screen; filter: drop-shadow(0 0 6px rgba(127,214,255,.35)); }
-.through .display .surface { background: transparent; }
-.raw .display .surface { background: #000; outline: 1px dashed #3a4450; }
-.surface { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 40px; }
-.raw .frame { display: none; }
-.raw .scene { background: #050607; }
-.raw canvas, .raw img.world { opacity: .08; }
-
-/* Display DSL look: FlexBox column, heading, body, ButtonGroup */
-.card { width: 100%; display: flex; flex-direction: column; gap: 18px; padding: 34px; border-radius: 34px;
-  background: rgba(40, 60, 80, .55); border: 2px solid rgba(242,251,255,.18); }
-.card .eyebrow { font: 600 22px/1 var(--font-ui); letter-spacing: .16em; text-transform: uppercase; color: var(--accent); display: flex; justify-content: space-between; }
-.card .eyebrow small { color: rgba(242,251,255,.8); letter-spacing: .06em; font-weight: 500; }
-.card .body { font: 500 36px/1.28 var(--font-ui); text-wrap: pretty; max-height: 290px; overflow: hidden; }
-.card.alert { border-color: rgba(255,181,71,.7); }
-.card.alert .eyebrow { color: var(--warn); }
-.btns { display: flex; gap: 14px; }
-.btns button { flex: 1; font: 600 26px/1 var(--font-ui); padding: 20px 16px; border-radius: 999px; border: 2px solid rgba(242,251,255,.35); background: transparent; color: var(--hud); cursor: pointer; }
-.btns button.primary { background: rgba(242,251,255,.92); color: #0b0d10; border-color: transparent; }
-.btns button.focus { outline: 4px solid var(--accent); outline-offset: 4px; }
-.home { text-align: center; display: grid; gap: 10px; }
-.home .time { font: 600 120px/1 var(--font-ui); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-.home .glance { font: 500 30px/1.3 var(--font-ui); color: var(--hud); }
-.wave { display: flex; gap: 10px; align-items: center; height: 60px; }
-.wave i { width: 10px; height: 20px; border-radius: 6px; background: var(--accent); animation: bar 1s ease-in-out infinite; }
-.wave i:nth-child(2) { animation-delay: .12s } .wave i:nth-child(3) { animation-delay: .24s } .wave i:nth-child(4) { animation-delay: .36s } .wave i:nth-child(5) { animation-delay: .48s }
-@keyframes bar { 50% { height: 56px; } }
-@media (prefers-reduced-motion: reduce) { .wave i { animation: none; height: 36px; } }
-
-.under { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 var(--font-ui); margin: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 16px; }
+.wrap { max-width: 1320px; margin: 0 auto; display: grid; gap: 14px; }
+header { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+h1 { margin: 0; font: 600 1.1rem/1 var(--font-hud); letter-spacing: .2em; text-transform: uppercase; }
+h1 b { color: var(--cyan); font-weight: 600; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: var(--panel); }
-.seg button { font: 500 13px var(--font-ui); color: var(--dim); background: none; border: 0; padding: 6px 14px; border-radius: 999px; cursor: pointer; }
-.seg button[aria-pressed="true"] { background: var(--line); color: var(--fg); }
-.band { display: inline-flex; gap: 6px; flex-wrap: wrap; }
-.band button { font: 500 12px var(--font-mono); color: var(--fg); background: var(--panel); border: 1px solid var(--line); padding: 7px 11px; border-radius: 8px; cursor: pointer; }
-.band button:hover, .seg button:hover { color: var(--fg); }
-.note { font-size: 12.5px; color: var(--dim); margin: 0; }
+.seg button { font: 500 13px var(--font-ui); color: var(--dim); background: none; border: 0; padding: 7px 14px; border-radius: 999px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: #1d2a35; color: var(--fg); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.main { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) 300px; align-items: start; }
+@media (max-width: 900px) { .main { grid-template-columns: minmax(0, 1fr); } .phone-wrap { justify-self: center; } }
 
-/* ---- console ---- */
-.console { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px; display: grid; gap: 16px; min-width: 0; }
-.console h2 { margin: 0; font: 600 11px/1 var(--font-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
-form.say { display: flex; gap: 8px; }
-form.say input { flex: 1; min-width: 0; font: 15px var(--font-ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; }
-.btn { font: 600 14px var(--font-ui); color: #0b0d10; background: var(--accent); border: 0; border-radius: 10px; padding: 0 16px; cursor: pointer; }
-.btn.ghost { color: var(--fg); background: transparent; border: 1px solid var(--line); padding: 9px 12px; }
-.btn:disabled { opacity: .5; cursor: default; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* ---------- stage ---------- */
+.stage { position: relative; height: clamp(440px, 74vh, 720px); border-radius: 20px; overflow: hidden; background: #000; border: 1px solid var(--line); touch-action: none; cursor: grab; user-select: none; }
+.stage.dragging { cursor: grabbing; }
+#world { position: absolute; inset: 0; width: 100%; height: 100%; }
+.rims { position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(#000 0, rgba(0,0,0,.85) 4%, transparent 14%), radial-gradient(130% 120% at 50% 55%, transparent 62%, rgba(0,0,0,.75) 100%); }
+.rims::after { content: ""; position: absolute; left: -3%; top: 30%; width: 7%; height: 45%; border-radius: 50%; background: rgba(0,0,0,.6); filter: blur(18px); }
+.hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); font: 500 12px var(--font-hud); letter-spacing: .14em; text-transform: uppercase; color: rgba(239,250,255,.75); pointer-events: none; transition: opacity .6s; text-align: center; width: 90%; }
+
+/* Ray-Ban Display: the real FRIDAY glasses web app, 600x600, head-locked right of center, additive light */
+.rb { mix-blend-mode: screen; position: absolute; left: 64%; top: 55%; width: min(48vmin, 380px); aspect-ratio: 1; transform: translate(-50%, -50%); }
+.rb iframe { position: absolute; left: 0; top: 0; width: 600px; height: 600px; border: 0; transform-origin: 0 0; background: #000; }
+.rb.raw { mix-blend-mode: normal; } .rb.raw iframe { outline: 2px dashed #2c3640; }
+.rb .ring { position: absolute; inset: -6px; border-radius: 10px; border: 1px solid rgba(111,216,255,0); transition: border-color .2s; pointer-events: none; }
+.rb:focus-within .ring { border-color: rgba(111,216,255,.5); }
+
+/* Stark concept: full-field HUD */
+.stark { position: absolute; inset: 0; pointer-events: none; color: var(--cyan); font-family: var(--font-hud); mix-blend-mode: screen; }
+.stark .pe { pointer-events: auto; }
+.lit { filter: drop-shadow(0 0 5px rgba(111,216,255,.5)); } /* emulates waveguide bloom, not decoration */
+.compass { position: absolute; left: 50%; top: 7%; width: min(56%, 560px); height: 34px; transform: translateX(-50%); overflow: hidden;
+  -webkit-mask: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent); mask: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent); }
+.compass .tape { position: absolute; top: 0; left: 0; height: 100%; white-space: nowrap; font-size: 12px; letter-spacing: .1em; }
+.compass .tape span { display: inline-block; width: 30px; text-align: center; border-left: 1px solid rgba(111,216,255,.35); height: 10px; line-height: 30px; }
+.compass .tape span.major { height: 16px; color: var(--hud); }
+.compass::after { content: ""; position: absolute; left: 50%; top: 0; width: 2px; height: 20px; background: var(--hud); transform: translateX(-1px); }
+.readout { position: absolute; font-size: 12px; letter-spacing: .16em; text-transform: uppercase; line-height: 1.5; color: var(--hud); }
+.readout b { display: block; font: 500 30px/1.05 var(--font-hud); letter-spacing: .04em; color: var(--hud); }
+.tl { left: 4%; top: 8%; } .tr { right: 4%; top: 8%; text-align: right; }
+.reticle { position: absolute; left: 50%; top: 52%; width: 120px; height: 120px; transform: translate(-50%, -50%); }
+.reticle circle { fill: none; stroke: rgba(111,216,255,.6); stroke-width: 1.2; }
+.reticle .spin { transform-origin: 60px 60px; animation: spin 18s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.pane { position: absolute; border: 1px solid rgba(111,216,255,.5); background: linear-gradient(160deg, rgba(20,60,90,.4), rgba(10,30,50,.2)); border-radius: 4px 18px 4px 18px; padding: 14px 16px; }
+.pane h3 { margin: 0 0 8px; font: 600 11px/1 var(--font-hud); letter-spacing: .24em; text-transform: uppercase; color: var(--cyan); display: flex; justify-content: space-between; gap: 10px; }
+.pane h3 small { color: var(--hud); letter-spacing: .1em; }
+.reply { right: 4%; top: 22%; width: min(36%, 400px); }
+.reply p { margin: 0; font: 500 19px/1.4 var(--font-ui); color: var(--hud); min-height: 1.4em; text-wrap: pretty; }
+.reply.alert { border-color: rgba(255,181,71,.85); } .reply.alert h3 { color: var(--amber); }
+.mirror { left: 4%; top: 22%; width: min(24%, 230px); }
+.mirror img { display: block; width: 100%; border-radius: 18px; }
+.mirror .off { font: 13px var(--font-ui); color: var(--hud); }
+.mem { left: 4%; bottom: 6%; width: min(42%, 470px); }
+.mem ul { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.mem li { font: 500 13px/1.3 var(--font-ui); color: var(--hud); border: 1px solid rgba(111,216,255,.45); border-radius: 3px; padding: 4px 8px; }
+.rem { right: 4%; bottom: 6%; width: min(30%, 300px); }
+.rem .r { display: grid; grid-template-columns: 34px 1fr; gap: 10px; align-items: center; font: 500 13px var(--font-ui); color: var(--hud); margin-top: 6px; }
+.rem svg circle { fill: none; stroke-width: 3; }
+.boot .pane, .boot .compass, .boot .readout, .boot .reticle { animation: bootIn .9s cubic-bezier(.2,.8,.2,1) both; }
+.boot .mirror, .boot .tl { animation-delay: .12s } .boot .reply, .boot .tr { animation-delay: .25s } .boot .mem, .boot .rem { animation-delay: .4s }
+@keyframes bootIn { from { opacity: 0; transform: translateY(8px) scale(.98); filter: blur(4px); } }
+.flash { position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 0 rgba(255,181,71,0); transition: box-shadow .4s; }
+.flash.on { box-shadow: inset 0 0 140px rgba(255,181,71,.45); }
+@media (max-width: 720px) { .mirror, .tr, .reticle { display: none; } .reply { left: 4%; right: 4%; width: auto; top: 20%; } .mem { width: 92%; bottom: 22%; } .rem { left: 4%; width: 92%; bottom: 4%; } }
+
+/* ---------- simulated iPhone running the FRIDAY app ---------- */
+.phone-wrap { display: grid; gap: 8px; justify-items: center; }
+.iphone { width: 300px; height: 620px; border-radius: 52px; padding: 12px; background: #1b1e22; border: 1px solid #2b3036; box-shadow: 0 30px 60px rgba(0,0,0,.5), inset 0 0 0 2px #0a0b0d; }
+.screen { position: relative; width: 100%; height: 100%; border-radius: 41px; overflow: hidden; background: #000; color: #f2f4f7; font: 14px/1.35 var(--font-ios); display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.island { position: absolute; top: 9px; left: 50%; width: 92px; height: 26px; border-radius: 20px; background: #000; transform: translateX(-50%); z-index: 2; }
+.sbar { display: flex; justify-content: space-between; padding: 14px 26px 6px; font: 600 14px var(--font-ios); }
+.app-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 16px 10px; border-bottom: 1px solid #1c1f24; }
+.app-head strong { font: 600 13px var(--font-hud); letter-spacing: .22em; color: var(--cyan); }
+.pill { font: 600 11px var(--font-ios); padding: 4px 9px; border-radius: 999px; background: #1c2128; color: #b9c3cc; border: 0; cursor: pointer; }
+.pill.on { background: rgba(48,209,88,.16); color: #4fe07f; }
+.feed { overflow-y: auto; padding: 12px 12px 6px; display: flex; flex-direction: column; gap: 6px; }
+.b { max-width: 84%; padding: 8px 11px; border-radius: 17px; font-size: 13.5px; line-height: 1.3; }
+.b.friday { align-self: flex-start; background: #1d232b; border-bottom-left-radius: 5px; }
+.b.you { align-self: flex-end; background: var(--ios); color: #fff; border-bottom-right-radius: 5px; }
+.b.heard { align-self: flex-end; background: transparent; color: #8e98a3; font-style: italic; font-size: 12.5px; padding: 2px 4px; }
+.b.note { align-self: center; background: transparent; color: #8e98a3; font-size: 12px; text-align: center; }
+.dock { padding: 8px 10px 22px; display: grid; gap: 8px; border-top: 1px solid #1c1f24; background: #050607; }
+.tools { display: flex; gap: 6px; justify-content: space-between; }
+.tool { flex: 1; font: 600 11px var(--font-ios); color: #dfe5ea; background: #161a1f; border: 0; border-radius: 12px; padding: 8px 4px; cursor: pointer; }
+.tool[aria-pressed="true"] { background: rgba(10,132,255,.25); color: #8cc4ff; }
+.tool:disabled { opacity: .4; cursor: default; }
+form.msg { display: flex; gap: 6px; }
+form.msg input { flex: 1; min-width: 0; font: 14px var(--font-ios); color: #f2f4f7; background: #161a1f; border: 1px solid #23282f; border-radius: 18px; padding: 8px 12px; }
+form.msg button { width: 34px; height: 34px; border-radius: 50%; border: 0; background: var(--ios); color: #fff; font: 700 16px var(--font-ios); cursor: pointer; }
+.sheet { position: absolute; inset: auto 0 0 0; background: #111418; border-radius: 26px 26px 41px 41px; padding: 18px 18px 26px; display: grid; gap: 10px; justify-items: center; text-align: center; box-shadow: 0 -10px 40px rgba(0,0,0,.6); z-index: 3; }
+.sheet h4 { margin: 0; font: 600 16px var(--font-ios); }
+.sheet p { margin: 0; font-size: 12.5px; color: #a9b3bd; }
+.sheet canvas { width: 150px; height: 150px; border-radius: 12px; background: #fff; }
+.sheet code { font: 600 13px ui-monospace, Menlo, monospace; letter-spacing: .1em; color: #f2f4f7; }
+.sheet .acts { display: flex; gap: 8px; width: 100%; }
+.sheet .acts button { flex: 1; font: 600 13px var(--font-ios); border: 0; border-radius: 12px; padding: 10px; cursor: pointer; background: #1d232b; color: #f2f4f7; }
+.sheet .acts button.primary { background: var(--ios); color: #fff; }
+.caption { font-size: 12px; color: var(--dim); text-align: center; max-width: 300px; margin: 0; }
+
+/* ---------- console ---------- */
+.console { display: grid; gap: 12px; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+@media (max-width: 900px) { .console { grid-template-columns: minmax(0, 1fr); } }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; display: grid; gap: 10px; min-width: 0; align-content: start; }
+.box h2 { margin: 0; font: 600 11px/1 var(--font-hud); letter-spacing: .2em; text-transform: uppercase; color: var(--dim); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chips button { font: 13px var(--font-ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 6px 11px; cursor: pointer; text-align: left; }
-.row { display: flex; flex-wrap: wrap; gap: 8px; }
-.log { display: grid; gap: 8px; max-height: 260px; overflow-y: auto; font-size: 14px; }
-.log div { display: grid; gap: 1px; }
-.log b { font: 500 11px var(--font-mono); letter-spacing: .06em; color: var(--dim); }
-.log .friday b { color: var(--accent); }
-.log .heard { color: var(--dim); font-style: italic; }
-.mem { margin: 0; padding-left: 18px; font-size: 14px; color: var(--fg); display: grid; gap: 4px; }
-.mem:empty::before { content: "Nothing yet. Try \"Friday, remember I'm allergic to shellfish.\""; color: var(--dim); margin-left: -18px; }
-.status { font-size: 12.5px; color: var(--warn); min-height: 1em; margin: 0; }
+.chips button, .btn { font: 13px var(--font-ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 6px 11px; cursor: pointer; text-align: left; }
+.btn:disabled { opacity: .45; cursor: default; }
+.note { margin: 0; font-size: 12.5px; color: var(--dim); }
+.status { margin: 0; font-size: 13px; color: var(--amber); min-height: 1.2em; }
+label.toggle { display: inline-flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+@media (prefers-reduced-motion: reduce) { .reticle .spin { animation: none; } .boot * { animation: none !important; } }
 </style>
 
 <div class="wrap">
   <header>
-    <h1><span>FRIDAY</span> on Meta Ray-Ban Display</h1>
-    <div class="spec">RIGHT LENS · 600 × 600 PX · ~20° FOV · ADDITIVE WAVEGUIDE</div>
+    <h1><b>FRIDAY</b> · Lens</h1>
+    <div class="row">
+      <div class="seg" role="group" aria-label="Glasses view">
+        <button id="m-rb" aria-pressed="true">Ray-Ban Display</button>
+        <button id="m-stark" aria-pressed="false">Stark mode</button>
+      </div>
+      <div class="seg" role="group" aria-label="Display rendering" id="rbView">
+        <button id="v-eye" aria-pressed="true">Your eye</button>
+        <button id="v-raw" aria-pressed="false">Raw pixels</button>
+      </div>
+    </div>
   </header>
 
-  <section class="viewer" aria-label="View through the glasses">
-    <div class="scene through" id="scene">
-      <canvas id="city" aria-hidden="true"></canvas>
-      <div class="frame"></div>
-      <div class="lens" id="lens">
-        <div class="display" id="display" role="region" aria-live="polite" aria-label="Glasses display">
-          <div class="surface" id="surface"></div>
+  <div class="main">
+    <section class="stage" id="stage" aria-label="First-person view through the glasses. Drag to look around.">
+      <canvas id="world" aria-hidden="true"></canvas>
+      <div class="rb" id="rb">
+        <iframe id="lens" src="glasses/index.html" title="FRIDAY glasses app on the Ray-Ban Display panel" width="600" height="600"></iframe>
+        <div class="ring"></div>
+      </div>
+      <div class="stark" id="stark" hidden aria-live="polite">
+        <div class="compass lit" aria-hidden="true"><div class="tape" id="tape"></div></div>
+        <div class="readout tl lit"><b id="clock">--:--</b><span id="date"></span></div>
+        <div class="readout tr lit"><b id="hdg">000°</b><span id="linkState">iPhone not paired</span></div>
+        <svg class="reticle lit" viewBox="0 0 120 120" aria-hidden="true"><circle cx="60" cy="60" r="4"/><g class="spin"><circle cx="60" cy="60" r="44" stroke-dasharray="18 10"/></g><circle cx="60" cy="60" r="56" stroke-dasharray="2 6"/></svg>
+        <div class="pane mirror lit"><h3>iPhone <small id="mirrorState">screen off</small></h3><div id="mirrorBody"><div class="off">Turn on "Share screen" on the phone to see it here.</div></div></div>
+        <div class="pane reply lit" id="replyPane"><h3><span id="replyLabel">FRIDAY</span><small id="replyState">standing by</small></h3><p id="replyText">Good evening. Drag to look around, or talk to me from the phone.</p></div>
+        <div class="pane mem lit"><h3>Memory <small id="memCount">0 facts</small></h3><ul id="memList"></ul></div>
+        <div class="pane rem lit"><h3>Reminders <small id="remCount">none</small></h3><div id="remList"></div></div>
+      </div>
+      <div class="flash" id="flash"></div>
+      <div class="rims"></div>
+      <div class="hint" id="hint">Drag to look around · click the lens and use arrow keys + Enter to navigate it</div>
+    </section>
+
+    <div class="phone-wrap">
+      <div class="iphone" aria-label="Simulated iPhone running the FRIDAY app">
+        <div class="screen" id="phoneScreen">
+          <div class="island"></div>
+          <div class="sbar"><span id="pclock">9:41</span><span aria-hidden="true">•••• 5G ▮</span></div>
+          <div class="app-head"><strong>FRIDAY</strong><button class="pill" id="pairPill">Pair glasses</button></div>
+          <div class="feed" id="feed" aria-live="polite"></div>
+          <div class="dock">
+            <div class="tools">
+              <button class="tool" id="shareBtn" aria-pressed="false" disabled>Share screen</button>
+              <button class="tool" id="lookBtn" disabled>Look</button>
+              <button class="tool" id="voiceBtn" aria-pressed="true">Voice on</button>
+            </div>
+            <form class="msg" id="msgForm"><input id="msg" autocomplete="off" placeholder="Say something…" aria-label="What you say out loud"><button aria-label="Send">↑</button></form>
+          </div>
+          <div class="sheet" id="sheet" hidden>
+            <h4>Pair your glasses</h4>
+            <p>Scan this with the glasses to add FRIDAY. The code works once and expires in 10 minutes.</p>
+            <canvas id="qr" width="150" height="150" aria-label="Pairing code shown as a QR-style pattern (simulated)"></canvas>
+            <code id="pairCode"></code>
+            <div class="acts"><button id="sheetCancel">Cancel</button><button class="primary" id="sheetScan">Glasses scanned it</button></div>
+          </div>
         </div>
       </div>
+      <p class="caption">A simulated iPhone running FRIDAY. In the real system it's the ears, voice and camera; the glasses are its screen.</p>
     </div>
-    <div class="under">
-      <div class="seg" role="group" aria-label="View mode">
-        <button id="m-through" aria-pressed="true">Through the lens</button>
-        <button id="m-raw" aria-pressed="false">Raw display</button>
-      </div>
-      <div class="band" role="group" aria-label="Neural Band gestures">
-        <button id="g-swipe" title="Move focus between lens buttons (→ key)">Swipe ›</button>
-        <button id="g-pinch" title="Press the focused lens button (Enter)">Pinch</button>
-        <button id="g-double" title="Wake FRIDAY and start talking (/ key)">Double-tap</button>
-      </div>
-    </div>
-    <p class="note">The Neural Band buttons stand in for the wristband's gestures. The card layout matches what the iPhone app sends through Meta's display toolkit: a FlexBox with a heading, a body and buttons.</p>
-  </section>
+  </div>
 
-  <section class="console" aria-label="Talk to FRIDAY">
-    <div style="display:grid;gap:8px">
-      <h2>Say something</h2>
-      <form class="say" id="sayForm">
-        <input id="say" autocomplete="off" placeholder="Friday, what can you do?" aria-label="What you say out loud">
-        <button class="btn" id="sendBtn">Say</button>
-      </form>
+  <section class="console">
+    <div class="box">
+      <h2>Try saying</h2>
       <div class="chips" id="chips">
         <button>Friday, what can you do?</button>
         <button>Friday, remember I'm allergic to shellfish.</button>
-        <button>Friday, remind me to stretch in 20 seconds.</button>
+        <button>Friday, remind me to stretch in 30 seconds.</button>
         <button>I'll grab coffee with Sam on Thursday.</button>
         <button>Friday, what did I say about Sam?</button>
       </div>
-      <p class="note">Speech without "Friday" is heard and remembered, but FRIDAY stays quiet, the same as the real app.</p>
+      <p class="note">Lines without "Friday" are heard and remembered while FRIDAY stays quiet, the same as the real app. On the glasses, open Talk and tap Ask to type there instead.</p>
     </div>
-
-    <div style="display:grid;gap:8px">
-      <h2>Glasses camera</h2>
+    <div class="box">
+      <h2>Simulate</h2>
       <div class="row">
-        <label class="btn ghost" for="photo" id="photoLabel">Put on a scene (photo)</label>
+        <label class="btn" for="photo">Look at a photo</label>
         <input type="file" id="photo" accept="image/*" hidden>
-        <button class="btn ghost" id="lookBtn" disabled>Friday, what am I looking at?</button>
+        <button class="btn" id="alertBtn">Storm alert</button>
+        <button class="btn" id="g-swipe">Swipe ↓</button>
+        <button class="btn" id="g-pinch">Pinch</button>
+        <button class="btn" id="g-back">Back</button>
       </div>
-      <p class="note">Choose a photo to stand in for what you're looking at. It becomes the world behind the lens and what the glasses camera sees.</p>
-    </div>
-
-    <div style="display:grid;gap:8px">
-      <h2>Proactive</h2>
-      <div class="row">
-        <button class="btn ghost" id="alertBtn">Send a sample weather alert</button>
-      </div>
-    </div>
-
-    <p class="status" id="status" role="status"></p>
-
-    <div style="display:grid;gap:8px">
-      <h2>Transcript</h2>
-      <div class="log" id="log"></div>
-    </div>
-    <div style="display:grid;gap:8px">
-      <h2>What FRIDAY remembers (this browser)</h2>
-      <ol class="mem" id="mem"></ol>
+      <p class="status" id="status" role="status"></p>
     </div>
   </section>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const surface = $("surface"), log = $("log"), statusEl = $("status");
-const store = {
-  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
-};
-let memory = store.get("friday.memory", []);
-let heard = [];          // recent ambient lines, for context
-let turns = [];          // short chat history for the model
-let photo = null;        // Blob from the "glasses camera"
-let reminders = [];
-let focusIdx = 0;
-let lastSpoke = 0;
-let sample = null, canTools = false, canImages = false;
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const S = { mode: store.get("friday.mode", "rb"), paired: store.get("friday.paired", false), sharing: false, voice: true, yaw: 0, pitch: 0, heading: 312 };
+let memory = store.get("friday.memory2", []), heard = [], turns = [], feed = [], reminders = [];
+let photoBlob = null, photoImg = null, lastSpoke = 0, sample = null, canTools = false, canImages = false, glassesReady = false;
 
-/* ---------- the display (mirrors the iOS Glasses.show card) ---------- */
-function fitDisplay() {
-  const lens = $("lens").getBoundingClientRect();
-  $("display").style.transform = `scale(${lens.width / 600})`;
-}
-new ResizeObserver(fitDisplay).observe($("lens"));
-
-function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-
-function showHome() {
-  const now = new Date();
-  const home = el("div", "home");
-  home.append(el("div", "time", now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M/i, "")));
-  const next = reminders[0];
-  home.append(el("div", "glance", next ? `Next: ${next.text}` : "Double-tap to talk to FRIDAY"));
-  surface.replaceChildren(home);
-}
-function showListening() {
-  const card = el("div", "card");
-  const eb = el("div", "eyebrow", "FRIDAY"); eb.append(el("small", null, "listening"));
-  const wave = el("div", "wave"); for (let i = 0; i < 5; i++) wave.append(el("i"));
-  card.append(eb, wave); surface.replaceChildren(card);
-}
-function showCard(text, { kind = "reply", label = "now", buttons = [["Dismiss", showHome]] } = {}) {
-  const card = el("div", "card" + (kind === "alert" ? " alert" : ""));
-  const eb = el("div", "eyebrow", kind === "alert" ? "Alert" : "FRIDAY"); eb.append(el("small", null, label));
-  const body = el("div", "body", text);
-  card.append(eb, body);
-  if (buttons.length) {
-    const row = el("div", "btns");
-    buttons.forEach(([name, fn], i) => {
-      const b = el("button", i === 0 ? "primary" : "", name);
-      b.addEventListener("click", fn);
-      row.append(b);
-    });
-    card.append(row);
-  }
-  surface.replaceChildren(card);
-  focusIdx = 0; paintFocus();
-}
-function lensButtons() { return [...surface.querySelectorAll(".btns button")]; }
-function paintFocus() { lensButtons().forEach((b, i) => b.classList.toggle("focus", i === focusIdx)); }
-
-/* ---------- view mode + Neural Band ---------- */
-function setMode(raw) {
-  $("scene").className = "scene " + (raw ? "raw" : "through");
-  $("m-raw").setAttribute("aria-pressed", raw); $("m-through").setAttribute("aria-pressed", !raw);
-}
-$("m-through").onclick = () => setMode(false);
-$("m-raw").onclick = () => setMode(true);
-$("g-swipe").onclick = () => { const n = lensButtons().length; if (n) { focusIdx = (focusIdx + 1) % n; paintFocus(); } };
-$("g-pinch").onclick = () => lensButtons()[focusIdx]?.click();
-$("g-double").onclick = () => { showListening(); $("say").focus(); };
-document.addEventListener("keydown", (e) => {
-  if (e.target.matches("input")) return;
-  if (e.key === "ArrowRight") $("g-swipe").click();
-  else if (e.key === "Enter") $("g-pinch").click();
-  else if (e.key === "/") { e.preventDefault(); $("g-double").click(); }
-});
-
-/* ---------- the world behind the lens ---------- */
-function drawCity() {
-  const c = $("city"), r = c.getBoundingClientRect(), dpr = Math.min(devicePixelRatio || 1, 2);
-  c.width = r.width * dpr; c.height = r.height * dpr;
-  const g = c.getContext("2d"), w = c.width, h = c.height;
-  const sky = g.createLinearGradient(0, 0, 0, h);
-  sky.addColorStop(0, "#1b2a44"); sky.addColorStop(.55, "#4a5b78"); sky.addColorStop(.62, "#c98a5c"); sky.addColorStop(.66, "#2a2f38"); sky.addColorStop(1, "#15181d");
-  g.fillStyle = sky; g.fillRect(0, 0, w, h);
-  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-  for (let layer = 0; layer < 2; layer++) {
-    let x = 0;
-    while (x < w) {
-      const bw = (40 + rnd() * 90) * dpr * (layer ? 1.4 : 1), bh = h * (layer ? .25 + rnd() * .3 : .15 + rnd() * .2);
-      const top = h * .66 - bh;
-      g.fillStyle = layer ? "#0f1217" : "#232a35"; g.fillRect(x, top, bw, bh + h);
-      g.fillStyle = layer ? "rgba(255,206,120,.75)" : "rgba(255,206,120,.35)";
-      for (let wy = top + 8 * dpr; wy < h * .64; wy += 14 * dpr)
-        for (let wx = x + 6 * dpr; wx < x + bw - 8 * dpr; wx += 12 * dpr) if (rnd() > .62) g.fillRect(wx, wy, 5 * dpr, 7 * dpr);
-      x += bw + 4 * dpr;
+/* ================= world: a wet night street, slightly out of focus ================= */
+const cv = $("world"), g = cv.getContext("2d");
+let W = 0, H = 0, dpr = 1, backdrop = null, lights = [];
+const rng = (seed) => () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+function buildBackdrop() {
+  const r = cv.getBoundingClientRect(); if (!r.width) return; dpr = Math.min(devicePixelRatio || 1, 2);
+  W = cv.width = Math.round(r.width * dpr); H = cv.height = Math.round(r.height * dpr);
+  const bw = Math.round(W * 1.4), bh = Math.round(H * 1.4), off = document.createElement("canvas"); off.width = bw; off.height = bh;
+  const c = off.getContext("2d"), R = rng(11), horizon = bh * .66, vx = bw * .5;
+  const sky = c.createLinearGradient(0, 0, 0, bh);
+  sky.addColorStop(0, "#0a1020"); sky.addColorStop(.45, "#1a2238"); sky.addColorStop(.62, "#3a2f3a"); sky.addColorStop(.7, "#14161c"); sky.addColorStop(1, "#08090c");
+  c.fillStyle = sky; c.fillRect(0, 0, bw, bh);
+  for (const side of [-1, 1]) for (let i = 0; i < 9; i++) {
+    const t = i / 9, near = 1 - t;
+    const x0 = vx + side * (bw * .06 + bw * .46 * near), x1 = vx + side * (bw * .04 + bw * .38 * (1 - (i + 1) / 9));
+    const top = horizon - bh * (.18 + .5 * near * (.6 + R() * .5));
+    c.fillStyle = `rgb(${14 + 10 * t},${17 + 12 * t},${24 + 16 * t})`;
+    c.beginPath(); c.moveTo(x0, bh); c.lineTo(x0, top); c.lineTo(x1, top + (horizon - top) * .18); c.lineTo(x1, bh); c.fill();
+    const cols = 3 + Math.round(near * 5), rows = 4 + Math.round(near * 10);
+    for (let rr = 0; rr < rows; rr++) for (let cc = 0; cc < cols; cc++) {
+      if (R() < .55) continue;
+      const fx = (cc + .5) / cols, fy = (rr + .7) / (rows + 1), x = x0 + (x1 - x0) * fx, yTop = top + (horizon - top) * .18 * fx, y = yTop + (horizon * 1.02 - yTop) * fy;
+      c.fillStyle = R() < .8 ? `rgba(255,${180 + R() * 50 | 0},${110 + R() * 40 | 0},${.35 + R() * .5})` : `rgba(140,200,255,${.3 + R() * .4})`;
+      const s = (2 + near * 7) * dpr; c.fillRect(x, y, s, s * 1.3);
     }
   }
-  g.fillStyle = "#0b0d10"; g.fillRect(0, h * .8, w, h);
+  const road = c.createLinearGradient(0, horizon, 0, bh); road.addColorStop(0, "#15171d"); road.addColorStop(1, "#050608");
+  c.fillStyle = road; c.beginPath(); c.moveTo(vx - bw * .05, horizon); c.lineTo(vx + bw * .05, horizon); c.lineTo(bw * 1.1, bh); c.lineTo(-bw * .1, bh); c.fill();
+  c.globalAlpha = .25; c.strokeStyle = "#e8d9a8"; c.lineWidth = 3 * dpr; c.setLineDash([30 * dpr, 40 * dpr]); c.beginPath(); c.moveTo(vx, horizon); c.lineTo(vx, bh); c.stroke(); c.setLineDash([]); c.globalAlpha = 1;
+  backdrop = { canvas: off, w: bw, h: bh };
+  lights = Array.from({ length: 70 }, () => {
+    const depth = R(), side = R() < .5 ? -1 : 1, warm = R() < .7;
+    return { x: vx + side * bw * (.05 + .55 * (1 - depth) * R()), y: horizon - bh * (.02 + R() * .35 * (1 - depth)) + (R() < .25 ? bh * .12 : 0),
+      r: (6 + 34 * (1 - depth)) * dpr, hue: warm ? 28 + R() * 20 : (R() < .5 ? 195 : 330), a: .18 + R() * .3, ph: R() * 6.28, sp: .4 + R() };
+  });
+  for (let i = 0; i < 10; i++) lights.push({ car: true, lane: R() < .5 ? -1 : 1, t: R(), r: (8 + R() * 10) * dpr, sp: .02 + R() * .03 });
 }
-new ResizeObserver(drawCity).observe($("scene"));
+function drawWorld(time) {
+  if (!backdrop) return;
+  const ox = (backdrop.w - W) / 2 + S.yaw * dpr, oy = (backdrop.h - H) / 2 + S.pitch * dpr;
+  if (photoImg) {
+    const s = Math.max(W / photoImg.width, H / photoImg.height) * 1.25, pw = photoImg.width * s, ph = photoImg.height * s;
+    g.drawImage(photoImg, (W - pw) / 2 - S.yaw * dpr * .8, (H - ph) / 2 - S.pitch * dpr * .8, pw, ph); return;
+  }
+  g.filter = "blur(2.5px)"; g.drawImage(backdrop.canvas, -ox, -oy); g.filter = "none";
+  g.globalCompositeOperation = "lighter";
+  const horizon = backdrop.h * .66, vx = backdrop.w * .5;
+  for (const L of lights) {
+    let x, y, r = L.r, hue, a;
+    if (L.car) {
+      L.t = (L.t + (reduceMotion ? 0 : L.sp * .016)) % 1;
+      const t = L.lane > 0 ? L.t : 1 - L.t, k = t * t;
+      x = vx + L.lane * backdrop.w * (.01 + .42 * k); y = horizon + (backdrop.h - horizon) * k * .9; r = L.r * (.3 + k * 2.2); hue = L.lane > 0 ? 0 : 50; a = .45;
+    } else { x = L.x; y = L.y; hue = L.hue; a = L.a * (reduceMotion ? 1 : .8 + .2 * Math.sin(time / 1000 * L.sp + L.ph)); }
+    x -= ox; y -= oy;
+    if (x < -r || x > W + r || y < -r || y > H + r) continue;
+    const grd = g.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, `hsla(${hue},90%,70%,${a})`); grd.addColorStop(.6, `hsla(${hue},90%,60%,${a * .55})`); grd.addColorStop(1, `hsla(${hue},90%,55%,0)`);
+    g.fillStyle = grd; g.beginPath(); g.arc(x, y, r, 0, 6.283); g.fill();
+  }
+  g.globalCompositeOperation = "source-over";
+}
+(function loop(t) { drawWorld(t); requestAnimationFrame(loop); })(0);
+new ResizeObserver(() => { buildBackdrop(); fitLens(); paintHeading(); }).observe($("stage"));
 
-$("photo").addEventListener("change", () => {
-  const f = $("photo").files[0]; if (!f) return;
-  photo = f;
-  let img = document.querySelector("img.world");
-  if (!img) { img = el("img", "world"); img.alt = "Your chosen scene, seen through the glasses"; $("city").after(img); }
-  img.src = URL.createObjectURL(f); $("city").hidden = true;
-  $("lookBtn").disabled = !canImages;
-  if (!canImages) setStatus("This view can't send images to Claude, so the camera question is off. The photo still shows behind the lens.");
+/* look around: the display is head-locked, the world moves */
+let drag = null;
+$("stage").addEventListener("pointerdown", (e) => {
+  if (e.target.closest("#rb, button")) return;
+  drag = { x: e.clientX, y: e.clientY, yaw: S.yaw, pitch: S.pitch }; $("stage").setPointerCapture(e.pointerId); $("stage").classList.add("dragging"); $("hint").style.opacity = 0;
+});
+$("stage").addEventListener("pointermove", (e) => {
+  if (!drag || !backdrop) return;
+  const mx = (backdrop.w - W) / 2 / dpr, my = (backdrop.h - H) / 2 / dpr;
+  S.yaw = Math.max(-mx, Math.min(mx, drag.yaw - (e.clientX - drag.x))); S.pitch = Math.max(-my, Math.min(my, drag.pitch - (e.clientY - drag.y))); paintHeading();
+});
+addEventListener("pointerup", () => { drag = null; $("stage").classList.remove("dragging"); });
+
+/* ================= the lens: real FRIDAY glasses app (Meta UI Toolkit) ================= */
+const lens = $("lens");
+function fitLens() { lens.style.transform = `scale(${$("rb").getBoundingClientRect().width / 600})`; }
+function toGlasses(msg) { if (glassesReady) lens.contentWindow.postMessage(msg, "*"); }
+function glassesKey(key) {
+  // Neural Band gestures arrive on the glasses as directional/select input.
+  const doc = lens.contentDocument; if (!doc) return;
+  lens.focus();
+  const target = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : doc.body;
+  for (const type of ["keydown", "keyup"]) target.dispatchEvent(new KeyboardEvent(type, { key, code: key, bubbles: true, cancelable: true }));
+}
+$("g-swipe").onclick = () => glassesKey("ArrowDown");
+$("g-pinch").onclick = () => { const a = lens.contentDocument?.activeElement; if (a && a !== lens.contentDocument.body) a.click(); else glassesKey("Enter"); };
+$("g-back").onclick = () => lens.contentWindow?.history.back();
+addEventListener("message", (e) => {
+  if (e.source !== lens.contentWindow || !e.data) return;
+  if (e.data.type === "glasses-ready") { glassesReady = true; toGlasses({ type: "paired", on: S.paired }); toGlasses({ type: "memory", facts: factsOut() }); }
+  if (e.data.type === "utterance") hear(String(e.data.text || ""), "glasses");
 });
 
-/* ---------- transcript, memory ---------- */
-function addLog(who, text, cls = "") {
-  const d = el("div", cls); d.append(el("b", null, who), el("span", null, text));
-  log.append(d); log.scrollTop = log.scrollHeight;
+/* ================= Stark HUD ================= */
+function buildTape() { const t = $("tape"), d = { 0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW" }; for (let k = 0; k < 3; k++) for (let a = 0; a < 360; a += 15) t.append(el("span", a % 45 ? "" : "major", a % 45 ? "" : d[a])); }
+function paintHeading() {
+  const hdg = ((S.heading + S.yaw / 4) % 360 + 360) % 360; $("hdg").textContent = String(Math.round(hdg)).padStart(3, "0") + "°";
+  const box = document.querySelector(".compass").clientWidth; $("tape").style.transform = `translateX(${box / 2 - (360 + hdg) * 2}px)`;
 }
-function renderMemory() { $("mem").replaceChildren(...memory.map((m) => el("li", null, m))); }
-function setStatus(t) { statusEl.textContent = t || ""; }
+function hudReply(kind, label, text) {
+  $("replyPane").classList.toggle("alert", kind === "alert"); $("replyLabel").textContent = kind === "alert" ? "Alert" : "FRIDAY"; $("replyState").textContent = label;
+  if (text != null) $("replyText").textContent = text;
+}
+function paintMemory() {
+  $("memList").replaceChildren(...(memory.length ? memory.slice(-8).map((m) => el("li", null, m.text)) : [el("li", null, "Nothing yet")]));
+  $("memCount").textContent = `${memory.length} fact${memory.length === 1 ? "" : "s"}`;
+}
+function paintReminders() {
+  const box = $("remList"); box.replaceChildren(); $("remCount").textContent = reminders.length ? `${reminders.length} active` : "none";
+  const now = Date.now();
+  for (const r of reminders.slice(0, 3)) {
+    const left = Math.max(0, r.at - now), C = 2 * Math.PI * 13, frac = left / (r.at - r.set), row = el("div", "r");
+    row.innerHTML = `<svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true"><circle cx="17" cy="17" r="13" stroke="rgba(111,216,255,.25)"/><circle cx="17" cy="17" r="13" stroke="#6fd8ff" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - frac)}" transform="rotate(-90 17 17)"/></svg>`;
+    row.append(el("span", null, `${r.text} · ${Math.ceil(left / 1000)}s`)); box.append(row);
+  }
+}
+function paintClock() {
+  const n = new Date(); $("clock").textContent = n.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  $("date").textContent = n.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }); $("pclock").textContent = n.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M/i, "");
+}
+function setMode(m) {
+  S.mode = m; store.set("friday.mode", m);
+  $("m-rb").setAttribute("aria-pressed", m === "rb"); $("m-stark").setAttribute("aria-pressed", m === "stark");
+  $("rb").hidden = m !== "rb"; $("rbView").hidden = m !== "rb"; const st = $("stark"); st.hidden = m !== "stark";
+  if (m === "stark" && !reduceMotion) { st.classList.remove("boot"); void st.offsetWidth; st.classList.add("boot"); }
+  if (m === "rb") fitLens(); else paintHeading();
+}
+$("m-rb").onclick = () => setMode("rb"); $("m-stark").onclick = () => setMode("stark");
+$("v-eye").onclick = () => { $("rb").classList.remove("raw"); $("v-eye").setAttribute("aria-pressed", true); $("v-raw").setAttribute("aria-pressed", false); };
+$("v-raw").onclick = () => { $("rb").classList.add("raw"); $("v-raw").setAttribute("aria-pressed", true); $("v-eye").setAttribute("aria-pressed", false); };
 
-/* ---------- addressee rules (same as server/friday/addressee.py) ---------- */
+/* ================= the phone (plays the iPhone app + home server) ================= */
+function addFeed(who, text) { feed.push({ who, text }); feed = feed.slice(-30); paintFeed(); if (S.sharing) shareFrame(); }
+function paintFeed() {
+  const f = $("feed"); f.replaceChildren(...feed.map((x) => el("div", "b " + x.who, x.text)));
+  if (!feed.length) f.append(el("div", "b note", S.paired ? "Listening. Say \"Friday…\" to talk." : "Pair your glasses to see FRIDAY in your view."));
+  f.scrollTop = f.scrollHeight;
+}
+function setStatus(t) { $("status").textContent = t || ""; }
+function paintPair() {
+  $("pairPill").textContent = S.paired ? "Glasses · paired" : "Pair glasses"; $("pairPill").classList.toggle("on", S.paired);
+  $("shareBtn").disabled = !S.paired; $("lookBtn").disabled = !S.paired || !photoBlob || !canImages;
+  $("linkState").textContent = S.paired ? "iPhone linked" : "iPhone not paired";
+}
+function factsOut() { return memory.map((m) => `[${m.category}] ${m.text}`); }
+function speak(text) {
+  if (!S.voice) return;
+  try { speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; const v = speechSynthesis.getVoices().find((x) => /en-GB/i.test(x.lang)); if (v) u.voice = v; speechSynthesis.speak(u); } catch {}
+}
+function notify(kind, text, spoken) {
+  addFeed("friday", text); toGlasses({ type: "notify", kind, text }); hudReply("alert", kind, text); speak(spoken || text);
+}
+
+/* pairing: a one-time code shown as a QR code, exactly like the real flow (simulated scan) */
+function drawQR(code) {
+  const c = $("qr").getContext("2d"), n = 25, s = 150 / n, R = rng([...code].reduce((a, ch) => a * 31 + ch.charCodeAt(0), 7) % 2147483646 + 1);
+  c.fillStyle = "#fff"; c.fillRect(0, 0, 150, 150); c.fillStyle = "#000";
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (R() < .5) c.fillRect(x * s, y * s, s, s);
+  for (const [fx, fy] of [[0, 0], [n - 7, 0], [0, n - 7]]) { c.fillStyle = "#000"; c.fillRect(fx * s, fy * s, 7 * s, 7 * s); c.fillStyle = "#fff"; c.fillRect((fx + 1) * s, (fy + 1) * s, 5 * s, 5 * s); c.fillStyle = "#000"; c.fillRect((fx + 2) * s, (fy + 2) * s, 3 * s, 3 * s); }
+}
+$("pairPill").onclick = () => {
+  if (S.paired) { S.paired = false; store.set("friday.paired", false); toGlasses({ type: "paired", on: false }); stopShare(); paintPair(); paintFeed(); return; }
+  const code = Math.random().toString(36).slice(2, 8).toUpperCase(); $("pairCode").textContent = code; drawQR(code); $("sheet").hidden = false;
+};
+$("sheetCancel").onclick = () => { $("sheet").hidden = true; };
+$("sheetScan").onclick = () => {
+  $("sheet").hidden = true; S.paired = true; store.set("friday.paired", true); paintPair();
+  toGlasses({ type: "paired", on: true }); toGlasses({ type: "memory", facts: factsOut() });
+  addFeed("note", "Glasses paired. FRIDAY will show up in your view.");
+};
+
+/* screen sharing: the phone's FRIDAY screen drawn into a frame and sent to the glasses */
+function shareFrame() {
+  const w = 300, h = 520, c = document.createElement("canvas"); c.width = w * 2; c.height = h * 2;
+  const x = c.getContext("2d"); x.scale(2, 2);
+  x.fillStyle = "#1a2330"; x.fillRect(0, 0, w, h); // lit background: pure black would be invisible on an additive display
+  x.fillStyle = "#6fd8ff"; x.font = "600 13px sans-serif"; x.fillText("F R I D A Y", 16, 28);
+  x.fillStyle = "#4fe07f"; x.font = "600 11px sans-serif"; x.fillText("Glasses · paired", w - 112, 28);
+  let y = h - 16;
+  for (const item of [...feed].reverse()) {
+    if (y < 50) break;
+    x.font = "13px sans-serif"; const lines = wrap(x, item.text, 210); const bh = lines.length * 17 + 14; y -= bh;
+    const right = item.who === "you" || item.who === "heard", bx = right ? w - 16 - 224 : 16;
+    x.fillStyle = item.who === "you" ? "#0a84ff" : item.who === "friday" ? "#1d232b" : "rgba(0,0,0,0)";
+    roundRect(x, bx, y, 224, bh, 14); x.fill();
+    x.fillStyle = item.who === "heard" ? "#8e98a3" : "#f2f4f7"; lines.forEach((l, i) => x.fillText(l, bx + 11, y + 20 + i * 17)); y -= 8;
+  }
+  const frame = c.toDataURL("image/png");
+  toGlasses({ type: "screen", frame });
+  $("mirrorBody").replaceChildren(Object.assign(el("img"), { src: frame, alt: "Your iPhone screen" })); $("mirrorState").textContent = "live";
+}
+function wrap(ctx, text, max) { const out = []; let line = ""; for (const w of text.split(/\s+/)) { const t = line ? line + " " + w : w; if (ctx.measureText(t).width > max && line) { out.push(line); line = w; } else line = t; } if (line) out.push(line); return out.slice(0, 6); }
+function roundRect(x, a, b, w, h, r) { x.beginPath(); x.moveTo(a + r, b); x.arcTo(a + w, b, a + w, b + h, r); x.arcTo(a + w, b + h, a, b + h, r); x.arcTo(a, b + h, a, b, r); x.arcTo(a, b, a + w, b, r); x.closePath(); }
+function stopShare() { S.sharing = false; $("shareBtn").setAttribute("aria-pressed", false); toGlasses({ type: "screen", frame: null }); $("mirrorBody").replaceChildren(el("div", "off", "Turn on \"Share screen\" on the phone to see it here.")); $("mirrorState").textContent = "screen off"; }
+$("shareBtn").onclick = () => { if (S.sharing) return stopShare(); S.sharing = true; $("shareBtn").setAttribute("aria-pressed", true); shareFrame(); };
+$("voiceBtn").onclick = () => { S.voice = !S.voice; $("voiceBtn").setAttribute("aria-pressed", S.voice); $("voiceBtn").textContent = S.voice ? "Voice on" : "Voice off"; if (!S.voice) try { speechSynthesis.cancel(); } catch {} };
+
+/* ================= FRIDAY's brain (the server's job; here Claude via the page) ================= */
 const WAKE = /\b(?:hey|ok|okay|yo)?[\s,]*friday\b[\s,.!?]*/i;
 const WEEKDAY = /\b(on|this|next|last|by|until|till|every|since|before|after|from)\s+friday\b|\bfriday(?:'s|s)?\s+(night|morning|afternoon|evening|at|is|was)\b/i;
-function addressed(text) {
-  if (WAKE.test(text) && !WEEKDAY.test(text)) return text.replace(WAKE, " ").trim() || text;
-  if (Date.now() - lastSpoke < 10000) return text;
-  return null;
-}
-
-/* ---------- FRIDAY's brain (Claude, with page tools) ---------- */
-const RULES = () => `You are FRIDAY, a personal assistant speaking through Meta Ray-Ban Display glasses.
-Your reply is spoken aloud AND shown on a small lens card, so: at most 2 short sentences, under 30 words, no lists, no markdown, no emoji. Dry wit is fine.
-This is a browser preview: you can't place calls, send texts, or reach live data here. Say so briefly if asked, and mention the real app does it.
-Use the tools to save facts, recall them, and set reminders. Current local time: ${new Date().toLocaleString()}.
-Facts you know about the owner: ${memory.length ? memory.join("; ") : "none yet"}.
-Recently overheard (not addressed to you): ${heard.slice(-6).join(" | ") || "nothing"}.`;
-
+function addressed(t) { if (WAKE.test(t) && !WEEKDAY.test(t)) return t.replace(WAKE, " ").trim() || t; return Date.now() - lastSpoke < 10000 ? t : null; }
+const RULES = () => `You are FRIDAY, a personal assistant living in the owner's smart glasses and iPhone (think Tony Stark's FRIDAY: calm, quick, a little dry).
+Replies are spoken aloud and shown on the glasses display: at most 2 short sentences, under 30 words, no lists, markdown or emoji.
+This is a browser preview: you can't place calls, send texts, or fetch live data here. If asked, say so in one line and mention the real app does it.
+Use tools to save facts and set reminders. Local time: ${new Date().toLocaleString()}.
+Known facts: ${memory.length ? memory.map((m) => m.text).join("; ") : "none yet"}.
+Overheard recently (not addressed to you): ${heard.slice(-6).join(" | ") || "nothing"}.`;
 const TOOLS = [
   { name: "remember", description: "Save a durable fact about the owner. Returns 'saved'.",
-    inputSchema: { type: "object", properties: { fact: { type: "string" } }, required: ["fact"] },
-    execute: ({ fact }) => { const f = String(fact).slice(0, 200); memory.push(f); store.set("friday.memory", memory); renderMemory(); return "saved"; } },
-  { name: "set_reminder", description: "Remind the owner after a delay. Returns the due time.",
+    inputSchema: { type: "object", properties: { fact: { type: "string" }, category: { type: "string", description: "person|preference|health|work|place|other" } }, required: ["fact"] },
+    execute: ({ fact, category }) => { memory.push({ text: String(fact).slice(0, 160), category: String(category || "other").replace(/\W/g, "") || "other" }); store.set("friday.memory2", memory); paintMemory(); toGlasses({ type: "memory", facts: factsOut() }); return "saved"; } },
+  { name: "set_reminder", description: "Remind the owner after a delay in seconds. Returns the due time.",
     inputSchema: { type: "object", properties: { text: { type: "string" }, seconds: { type: "number" } }, required: ["text", "seconds"] },
-    execute: ({ text, seconds }) => {
-      const s = Math.max(5, Math.min(3600, Number(seconds) || 60)), r = { text: String(text), at: Date.now() + s * 1000 };
-      reminders.push(r); reminders.sort((a, b) => a.at - b.at);
-      setTimeout(() => fireReminder(r), s * 1000);
-      return `due at ${new Date(r.at).toLocaleTimeString()}`;
-    } },
+    execute: ({ text, seconds }) => addReminder(String(text), Number(seconds)) },
 ];
-
+function addReminder(text, seconds) {
+  const s = Math.max(5, Math.min(3600, seconds || 60)), r = { text, set: Date.now(), at: Date.now() + s * 1000 };
+  reminders.push(r); reminders.sort((a, b) => a.at - b.at); paintReminders();
+  setTimeout(() => { reminders = reminders.filter((x) => x !== r); paintReminders(); notify("reminder", "Reminder: " + text); }, s * 1000);
+  return `due at ${new Date(r.at).toLocaleTimeString()}`;
+}
 let ctl = null;
 async function ask(text, opts = {}) {
-  if (!sample) { showCard("I can't reach Claude from this view. Open the preview in claude.ai while signed in.", { label: "offline" }); return; }
+  if (!sample) { const t = "I can't reach Claude from here. Open this preview in claude.ai while signed in."; addFeed("friday", t); toGlasses({ type: "say", text: t }); return; }
   ctl?.abort(); ctl = new AbortController();
-  $("sendBtn").disabled = true;
-  showListening();
-  turns.push({ role: "user", content: text });
-  turns = turns.slice(-10);
+  toGlasses({ type: "thinking", on: true }); hudReply("reply", "thinking", "…");
+  turns.push({ role: "user", content: text }); turns = turns.slice(-10);
   try {
-    const call = { signal: ctl.signal, cache: false, modelTier: "quick",
-      onText: ({ text }) => showCard(text, { label: "speaking" }) };
-    if (canTools && !opts.images) { call.tools = TOOLS; delete call.cache; }
-    if (opts.images) call.images = opts.images;
+    const call = { signal: ctl.signal, modelTier: "quick", onText: ({ text: t }) => hudReply("reply", "speaking", t.split(/\n\s*\n/).pop()) };
+    if (opts.images) { call.images = opts.images; call.cache = false; } else if (canTools) call.tools = TOOLS; else call.cache = false;
     const { text: reply } = await sample([{ role: "user", content: RULES() }, ...turns], call);
-    const clean = reply.trim().split(/\n\s*\n/).pop();   // with tools, keep only the final round's words
+    const clean = reply.trim().split(/\n\s*\n/).pop();
     turns.push({ role: "assistant", content: clean });
-    showCard(clean, { label: "now", buttons: [["Dismiss", showHome], ["Reply", () => $("g-double").click()]] });
-    addLog("FRIDAY", clean, "friday");
-    lastSpoke = Date.now();
-    setStatus("");
+    addFeed("friday", clean); toGlasses({ type: "say", text: clean }); hudReply("reply", "now", clean); speak(clean);
+    lastSpoke = Date.now(); setStatus("");
   } catch (e) {
-    turns.pop();
+    turns.pop(); toGlasses({ type: "thinking", on: false });
     if (e.code === "cancelled") return;
-    const msg = {
-      not_granted: "FRIDAY needs your OK to use Claude in this preview. Allow it in the prompt, or check the artifact's permissions.",
-      sampling_disabled: "Claude isn't available on this account.",
-      rate_limited: "Too many requests just now. Wait a moment and try again.",
-      refused: "Claude declined that one. Try asking differently.",
-      session_expired: "Sign in to claude.ai again, then retry.",
-    }[e.code] || "Something went wrong reaching Claude. Try again.";
-    showCard(e.text || msg, { label: "error" });
-    setStatus(msg);
-  } finally {
-    $("sendBtn").disabled = false;
+    const msg = { not_granted: "FRIDAY needs your OK to use Claude here. Allow it when asked.", sampling_disabled: "Claude isn't available on this account.",
+      rate_limited: "Too many requests right now. Wait a moment, then try again.", refused: "Claude declined that one. Try asking differently.", session_expired: "Sign in to claude.ai again, then retry." }[e.code] || "Couldn't reach Claude. Try again.";
+    addFeed("note", msg); setStatus(msg);
   }
 }
-
-function hear(text) {
-  text = text.trim(); if (!text) return;
-  const cmd = addressed(text);
-  if (!cmd) {
-    heard.push(text);
-    addLog("HEARD", text + "  (not for FRIDAY, remembered quietly)", "heard");
-    return;
+function hear(raw, from) {
+  const text = raw.trim(); if (!text) return;
+  if (!S.paired && from === "glasses") return;
+  const cmd = from === "glasses" ? text.replace(WAKE, " ").trim() || text : addressed(text);
+  addFeed(cmd ? "you" : "heard", text); toGlasses({ type: "heard", text, addressed: !!cmd });
+  if (!cmd) { heard.push(text); setStatus("Heard and remembered. Not addressed to FRIDAY, so no reply."); return; }
+  if (/looking at/i.test(cmd)) {
+    if (!photoBlob || !canImages) { const t = "Pick a photo under Simulate first. It stands in for the glasses camera."; addFeed("friday", t); toGlasses({ type: "say", text: t }); return; }
+    turns = []; return ask("The attached image is a frame from my glasses camera. What am I looking at? Read any important text. Don't identify people by their face.", { images: photoBlob });
   }
-  addLog("YOU", text);
   ask(cmd);
 }
 
-function fireReminder(r) {
-  reminders = reminders.filter((x) => x !== r);
-  showCard(r.text, { label: "reminder", buttons: [["Done", showHome], ["Snooze 1 min", () => { TOOLS[1].execute({ text: r.text, seconds: 60 }); showHome(); }]] });
-  addLog("FRIDAY", "Reminder: " + r.text, "friday");
-}
-
-/* ---------- wiring ---------- */
-$("sayForm").addEventListener("submit", (e) => { e.preventDefault(); const v = $("say").value; $("say").value = ""; hear(v); });
-$("chips").addEventListener("click", (e) => { if (e.target.matches("button")) hear(e.target.textContent); });
-$("lookBtn").addEventListener("click", () => {
-  if (!photo) return;
-  addLog("YOU", "Friday, what am I looking at?");
-  turns = [];  // images aren't re-sent between turns, so keep this exchange self-contained
-  ask("The attached image is a frame from my glasses camera. What am I looking at? If there's text, read the important part. Don't identify people by their face.", { images: photo });
+/* ================= wiring ================= */
+$("msgForm").addEventListener("submit", (e) => { e.preventDefault(); const v = $("msg").value; $("msg").value = ""; hear(v, "phone"); });
+$("chips").addEventListener("click", (e) => { if (e.target.matches("button")) hear(e.target.textContent, "phone"); });
+$("photo").addEventListener("change", () => {
+  const f = $("photo").files[0]; if (!f) return; photoBlob = f;
+  const img = new Image(); img.onload = () => { photoImg = img; }; img.src = URL.createObjectURL(f); paintPair();
+  setStatus(canImages ? (S.paired ? "You're looking at your photo. Tap Look on the phone to ask about it." : "You're looking at your photo. Pair the glasses to ask about it.") : "This view can't send images to Claude. The photo still shows as your surroundings.");
 });
-$("alertBtn").addEventListener("click", () => {
-  const text = "Sample alert: severe thunderstorm warning for your area until 6:45 PM. Gusts to 60 mph.";
-  showCard(text, { kind: "alert", label: "weather", buttons: [["Got it", showHome], ["Details", () => ask("Give one practical tip for a severe thunderstorm warning in the next hour.")]] });
-  addLog("FRIDAY", text, "friday");
-});
+$("lookBtn").onclick = () => hear("Friday, what am I looking at?", "phone");
+$("alertBtn").onclick = () => {
+  notify("weather", "Severe thunderstorm warning until 6:45 PM. Gusts to 60 mph. (sample)", "Heads up. Severe thunderstorm warning until 6:45.");
+  $("flash").classList.add("on"); setTimeout(() => $("flash").classList.remove("on"), 1600);
+};
 
-renderMemory();
-showHome();
-setInterval(() => { if (surface.querySelector(".home")) showHome(); }, 30000);
-
+buildTape(); paintClock(); paintFeed(); paintMemory(); paintReminders(); paintPair(); setMode(S.mode); fitLens();
+setInterval(() => { paintClock(); paintReminders(); }, 1000);
 (async () => {
-  sample = await window.claude?.use?.("sample") ?? null;
+  sample = (await window.claude?.use?.("sample")) ?? null;
   if (!sample) { setStatus("Claude isn't reachable from this view, so FRIDAY can't answer. Open it in claude.ai while signed in."); return; }
-  const lim = await sample.limits().catch(() => null);
-  canTools = !!lim?.tools; canImages = !!lim?.images;
+  const lim = await sample.limits().catch(() => null); canTools = !!lim?.tools; canImages = !!lim?.images; paintPair();
   if (canImages) $("photo").accept = lim.images.mediaTypes.join(",");
 })();
 </script>

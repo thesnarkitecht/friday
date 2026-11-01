@@ -115,5 +115,16 @@ answer should appear in the lens preview.
 Developer Mode works for you and up to 100 testers through a release channel. Publishing to the public
 needs Meta's approval.
 
+## FRIDAY on the glasses (web app)
+
+`glasses/` is a web app that runs directly on Ray-Ban Display, built with Meta's own UI Toolkit.
+The phone stays the ears, voice and camera; the glasses show the conversation, memory, alerts and
+your phone's screen. See [glasses/README.md](../glasses/README.md) to build and pair it.
+
+No glasses? Open the [FRIDAY Lens preview](https://claude.ai/artifact/Lsa8d5RBMuLDfZxiGtzPGR):
+it runs the same build in a first-person view, paired with a simulated iPhone.
+
 ## Not included
 Body-worn ESP32 sensing of the people around you is not part of this build.
+Full-screen sharing from a real iPhone needs a ReplayKit broadcast extension (not built yet); the
+server and glasses already relay and show the frames.

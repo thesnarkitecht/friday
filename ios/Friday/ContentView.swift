@@ -85,6 +85,7 @@ struct SettingsView: View {
                     Text(glasses.status).foregroundStyle(.secondary)
                     Button("Connect glasses (opens Meta AI)") { Task { await glasses.register() } }
                     Button("Simulate Ray-Ban Display (no hardware)") { glasses.simulate() }
+                    NavigationLink("Pair glasses (FRIDAY web app)") { PairGlassesView() }
                 }
             }
             .navigationTitle("Settings")

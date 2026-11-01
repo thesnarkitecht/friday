@@ -150,7 +150,9 @@ def test_tool_call_reaches_phone_over_websocket(tmp_path):
     app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
     with TestClient(app) as c:
         with c.websocket_connect("/ws?token=secret") as ws:
+            assert ws.receive_json()["type"] == "memory"
             ws.send_json({"type": "utterance", "text": "Friday, lights off"})
+            assert ws.receive_json() == {"type": "heard", "text": "Friday, lights off", "addressed": True}
             assert ws.receive_json() == {"type": "action", "kind": "url",
                                          "url": "shortcuts://run-shortcut?name=Lights%20Off"}
             assert ws.receive_json() == {"type": "say", "text": "Lights are off."}
@@ -190,7 +192,9 @@ def test_glasses_frame_round_trip(tmp_path):
     app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
     with TestClient(app) as c:
         with c.websocket_connect("/ws?token=secret") as ws:
+            assert ws.receive_json()["type"] == "memory"
             ws.send_json({"type": "utterance", "text": "Friday, what does that sign say?"})
+            assert ws.receive_json()["type"] == "heard"
             action = ws.receive_json()
             assert action["kind"] == "glasses_frame"
             r = c.post("/api/glasses/frame", json={"id": action["id"], "jpeg": "/9j/AAAA"},
@@ -200,3 +204,33 @@ def test_glasses_frame_round_trip(tmp_path):
     vision_prompt = llm.sent[1][0]["content"]
     assert vision_prompt[1]["image_url"]["url"].startswith("data:image/jpeg;base64,/9j/")
     assert "Do not identify people" in vision_prompt[0]["text"]
+
+
+def test_pairing_code_is_single_use_and_replies_reach_every_device(tmp_path):
+    app = create_app(settings(tmp_path), llm=FakeLLM("On it."), feeds=FakeFeeds(), background=False)
+    h = {"Authorization": "Bearer secret"}
+    with TestClient(app) as c:
+        assert c.post("/api/pair").status_code == 401
+        p = c.post("/api/pair", headers=h).json()
+        assert p["url"].endswith(f"/glasses/?pair={p['code']}")
+        assert c.post("/api/pair/claim", json={"code": p["code"]}).json() == {"token": "secret"}
+        assert c.post("/api/pair/claim", json={"code": p["code"]}).status_code == 403
+        assert c.post("/api/pair/claim", json={"code": "guess"}).status_code == 403
+        with c.websocket_connect("/ws?token=secret") as phone, c.websocket_connect("/ws?token=secret") as glasses:
+            phone.receive_json(); glasses.receive_json()
+            phone.send_json({"type": "utterance", "text": "Friday, start a timer"})
+            for ws in (phone, glasses):
+                assert ws.receive_json()["type"] == "heard"
+                assert ws.receive_json() == {"type": "say", "text": "On it."}
+
+
+def test_phone_screen_frames_relay_to_glasses_only(tmp_path):
+    app = create_app(settings(tmp_path), llm=FakeLLM(), feeds=FakeFeeds(), background=False)
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws?token=secret") as phone, c.websocket_connect("/ws?token=secret") as glasses:
+            phone.receive_json(); glasses.receive_json()
+            phone.send_json({"type": "screen", "frame": "javascript:alert(1)"})  # not an image: dropped
+            phone.send_json({"type": "screen", "frame": "data:image/png;base64,AAAA"})
+            assert glasses.receive_json() == {"type": "screen", "frame": "data:image/png;base64,AAAA"}
+            phone.send_json({"type": "screen", "frame": None})
+            assert glasses.receive_json() == {"type": "screen", "frame": None}

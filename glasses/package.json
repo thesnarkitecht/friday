@@ -1,0 +1,27 @@
+{
+  "name": "friday-glasses",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FRIDAY web app for Meta Ray-Ban Display, built with UI Toolkit for Meta Ray-Ban Display",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@wearables-ui-toolkit/icons": "129.23.0",
+    "@wearables-ui-toolkit/mrbd": "129.23.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-router-dom": "7.18.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0",
+    "vitest": "^4.1.11"
+  }
+}
