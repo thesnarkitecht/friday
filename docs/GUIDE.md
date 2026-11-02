@@ -1,130 +1,133 @@
-# FRIDAY guide: shopping list, features, testing on iPhone
+# FRIDAY guide: hardware, presence, and how it learns
+
+FRIDAY is now just the engine: memory, the agent loop, the proactive loop, presence and the learning loop.
+Anything that can send text and play speech is a client (see "Talking to it" below).
 
 ## Shopping list
 
 Prices are approximate. Check before buying.
 
-| Item | Needed for | Cost |
+### The pocket unit
+
+| Item | Why | Cost |
 |---|---|---|
-| Home box with the Tenstorrent Blackhole cards (you have this) | Models, memory, the server | — |
-| iPhone on iOS 17.2+ | The app | — |
-| Mac with Xcode 26.4+ | Building the app (the glasses SDK requires this Xcode) | — |
-| Apple Developer Program | Installing on your phone for more than 7 days, Siri intents | $99/yr (a free Apple ID works, but apps expire after 7 days) |
-| Meta Ray-Ban Display + Neural Band | Replies on the lens, glasses camera, mic and speakers | about $799 |
-| *or* Ray-Ban Meta (Gen 2) | Glasses camera, mic and speakers; no display | about $379 |
-| Tailscale | Phone reaches the home box from anywhere | free personal plan |
-| Twilio number + usage | Calls FRIDAY makes on your behalf | about $1–2/month for the number, about 1–2¢/min |
-| AirPods (optional) | Hands-free listening when you're not wearing glasses | — |
+| Raspberry Pi 5, 8 GB (16 GB if you want a 4B model plus headroom) | Runs the engine and a small model | about $80 / $120 |
+| Official Active Cooler | A Pi 5 doing inference in a pocket throttles without it | about $5 |
+| Slim case that fits the cooler | Pocket | about $10 |
+| 64 GB+ A2 microSD, or an NVMe HAT + small SSD | Model files load much faster from NVMe | $12–40 |
+| USB-C power bank, 20,000 mAh, 5 V / 3 A output | 5–8 h of mixed use; the Pi 5 draws 8–10 W while generating | about $40 |
+| USB-C lavalier mic, or a small USB speakerphone | Ears | $15–60 |
+| Bluetooth earbuds | Voice | — |
+| *Optional:* Raspberry Pi AI HAT+ 2 (Hailo-10H, 8 GB on board) | Moves a 1–1.5B model off the CPU. Check its current model list first | about $130 |
 
-You don't need glasses to start: the app has a built-in glasses simulator (below).
+What runs on a Pi 5: a 1.5B–4B instruct model with tool calling (Qwen3-4B or Llama 3.2 3B, Q4) under
+`llama-server`. Expect a few words per second out and tens of tokens per second in. That's why prompt
+size matters so much (next section). Or keep the Blackhole box at home as the brain: point
+`FRIDAY_LLM_BASE_URL` at it over Tailscale and the Pi only runs the engine.
 
-## Features
+### Presence sensing (one per room)
 
-**Voice and memory**
-- Listens all day. Speech is transcribed on the iPhone; only text goes to your home box.
-- Knows when you're talking to it: wake word ("Friday…", not "see you Friday"), follow-ups for 10 s
-  after it speaks, and the model breaking ties when others are around.
-- Remembers: scores every sentence for importance, and each night turns the day into a summary, durable
-  facts about you, and reminders. Other people's words are deleted after that pass by default.
-- Ask it anything about your past: "What did I promise Mike last week?"
+| Item | Why | Cost |
+|---|---|---|
+| HLK-LD2450 24 GHz mmWave radar | Counts up to 3 people in the room, through clothes and in the dark. No camera | about $15 |
+| Seeed XIAO ESP32-C3 (or any ESP32 board) | Runs ESPHome and tells FRIDAY the count | about $5 |
+| USB-C phone charger + cable | Power | — |
+| *Optional:* HLK-LD2410C | The LD2450 can lose someone who sits perfectly still; the LD2410C catches still presence | about $5 |
 
-**Proactive**
-- Speaks due reminders, severe weather alerts, nearby M4+ earthquakes, and GitHub review requests and
-  mentions, once each.
+Start with one in the room you spend the most time in. Four wires: 5V, GND, TX→RX, RX→TX.
 
-**Acting for you**
-- Runs your Apple Shortcuts by name (lights, music, Focus, alarms, anything you build).
-- Starts calls and pre-fills texts on your iPhone; iOS asks you to confirm each one.
-- Phones businesses for you through Twilio: says it's an AI assistant, reaches the goal, reports back.
+ESPHome config, so the sensor reports changes to FRIDAY (check field names against the ESPHome
+`ld2450` and `http_request` docs for your version):
 
-**Seeing**
-- Public traffic cameras (NYC, London, California), described by a vision model.
-- Meta glasses camera: "Friday, what does that sign say?" grabs one frame and answers. It won't identify
-  people by their face.
+```yaml
+uart:
+  rx_pin: GPIO20
+  tx_pin: GPIO21
+  baud_rate: 256000
+ld2450:
+http_request:
+sensor:
+  - platform: ld2450
+    target_count:
+      name: People
+      on_value:
+        - http_request.post:
+            url: http://friday:8080/api/presence
+            request_headers:
+              Authorization: !secret friday_bearer   # "Bearer <FRIDAY_TOKEN>"
+              Content-Type: application/json
+            json:
+              room: office
+              people: !lambda 'return to_string((int) x);'
+```
 
-**Meta glasses**
-- Audio: the glasses act as a Bluetooth headset, so you talk to and hear FRIDAY through them.
-- Ray-Ban Display: every reply and alert also shows as a card on the lens.
+### Optional
 
-## Test it on your iPhone
+| Item | Why | Cost |
+|---|---|---|
+| Tailscale | Pocket unit reaches the home box from anywhere | free personal plan |
+| Twilio number + usage | Calls FRIDAY makes for you | about $1–2/month, 1–2¢/min |
 
-### 1. Start the server
+## Why big prompts were killing local models, and what changed
+
+Prompt processing is the slow part on small hardware. The old prompt put the clock and the recalled
+memories inside the system prompt, so every turn started from token zero. With the tool list, that
+was 2,000+ tokens re-read on every question.
+
+Now:
+- The system prompt and the tool list never change. `llama-server` and vLLM keep that prefix in the
+  KV cache, so a new turn only processes the new message.
+- The per-turn part (time, place, situation, 8 facts, 4 memories, each capped at 160 characters) goes
+  in a small `[context]` block on the latest message only. Earlier turns stay as plain text, so they
+  stay cached too.
+- History is 12 messages, and tool results are capped at 3,000 characters.
+- The nightly memory pass digests the day in ~6,000-character pieces, so it fits a 4k context window.
+
+Run `llama-server` with `--jinja` (tool calling) and `-c 4096` or more. Prompt caching is on by default.
+
+## How FRIDAY decides when to speak up
+
+- **Always, right away:** reminders you set, severe weather, nearby quakes, results of calls it made.
+- **Everything else** (GitHub today, any feed you add later) goes through two checks:
+  1. **Company.** If the presence sensors count more than one person, it waits. When they leave, you
+     get one line: "Catching you up: …".
+  2. **What it has learned.** When you push back within 90 seconds of an interruption ("stop", "not now",
+     "I know", "who cares"…), that kind of interruption scores lower. When you engage, it scores higher.
+     Below 0.4, that kind stops interrupting and waits for the next good moment instead: the next time
+     you talk to FRIDAY, or company leaving. Your reaction to a catch-up line tunes every kind in it, so
+     a kind you start caring about again works its way back to interrupting.
+
+`GET /api/hud` shows the presence count, the situation FRIDAY sees, and the learned scores.
+
+## Run it
+
 ```bash
 cd server
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env   # fill it in
 set -a; . ./.env; set +a
 uvicorn friday.app:app --host 0.0.0.0 --port 8080
 ```
-Set `FRIDAY_TOKEN` (long and random), `FRIDAY_OWNER_NAME`, home coordinates, and the model server URL.
-Check it from the box:
-```bash
-curl -H "Authorization: Bearer $FRIDAY_TOKEN" localhost:8080/api/hud
-```
-Ask it something through the API before involving the phone:
+
+Check it:
 ```bash
 curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"text":"What do you know about me?"}' localhost:8080/api/ask
 ```
 
-### 2. Connect the phone
-Install Tailscale on the box and the iPhone and sign in to both with the same account. Your server URL
-is `http://<box-name>:8080` (the name Tailscale shows for the box).
-
-### 3. Build and install the app
+Fake a sensor:
 ```bash
-cd ios
-brew install xcodegen
-xcodegen
-open Friday.xcodeproj
+curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"room":"office","people":2}' localhost:8080/api/presence
 ```
-In Xcode: select the Friday target, then Signing & Capabilities, and pick your team. Plug in the iPhone,
-choose it as the run destination, and press Run. On the phone, enable Developer Mode if iOS asks
-(Settings > Privacy & Security > Developer Mode).
 
-### 4. First run
-Allow microphone, speech recognition, location and notifications. Tap the gear, then enter the server URL
-and token. The dot next to FRIDAY turns green when it's connected.
+## Talking to it
 
-### 5. Things to try
-| Say | Expect |
+| Endpoint | Use |
 |---|---|
-| "Friday, remember I'm allergic to shellfish." | It confirms. Later: "Friday, what am I allergic to?" |
-| "Friday, remind me to stretch in two minutes." | It speaks the reminder two minutes later |
-| "Friday, any alerts near me?" | Weather and quake check for your location |
-| "Friday, run Lights Off." (make a Shortcut with that name first) | The Shortcuts app runs it |
-| "Friday, text Mom I'm running late." | It reads it back; say yes and Messages opens pre-filled |
-| "Friday, what's traffic like near Times Square?" | Nearby NYC camera, described |
-| A conversation without saying "Friday" | Nothing spoken back, but `/api/hud` shows it was heard |
+| `WS /ws?token=…` | Send `{"type":"utterance","text":…}` or `{"type":"presence","room":…,"people":…}`. Receive `heard`, `say`, `notify`, `memory` |
+| `POST /api/utterance` | Everything you hear. FRIDAY decides whether it was addressed |
+| `POST /api/ask` | Push-to-talk: always addressed |
+| `POST /api/presence` | Room sensors |
+| `GET /api/hud` | State, recent speech, notifications, learned scores |
 
-Siri: "Hey Siri, ask Friday what's on my mind." To use the Action button, go to Settings > Action Button >
-Shortcut > Ask FRIDAY.
-
-### 6. Glasses without glasses (simulator)
-Tap the gear, then **Simulate Ray-Ban Display**. The app pairs simulated glasses using Meta's
-MockDeviceKit: the iPhone's back camera becomes the glasses camera, and a lens preview appears on
-the main screen. Point the phone at a sign and say "Friday, what does that sign say?". FRIDAY's
-answer should appear in the lens preview.
-
-### 7. Real glasses
-1. Pair the glasses in the Meta AI app.
-2. In Meta AI, go to Settings > your glasses and turn on Developer Mode.
-3. In FRIDAY, tap the gear, then **Connect glasses**. Meta AI opens; approve FRIDAY there.
-4. Choose the glasses as the iPhone's audio device. Ask about something you're looking at. The first
-   time, Meta AI asks for camera permission.
-
-Developer Mode works for you and up to 100 testers through a release channel. Publishing to the public
-needs Meta's approval.
-
-## FRIDAY on the glasses (web app)
-
-`glasses/` is a web app that runs directly on Ray-Ban Display, built with Meta's own UI Toolkit.
-The phone stays the ears, voice and camera; the glasses show the conversation, memory, alerts and
-your phone's screen. See [glasses/README.md](../glasses/README.md) to build and pair it.
-
-No glasses? Open the [FRIDAY Lens preview](https://claude.ai/artifact/Lsa8d5RBMuLDfZxiGtzPGR):
-it runs the same build in a first-person view, paired with a simulated iPhone.
-
-## Not included
-Body-worn ESP32 sensing of the people around you is not part of this build.
-Full-screen sharing from a real iPhone needs a ReplayKit broadcast extension (not built yet); the
-server and glasses already relay and show the frames.
+Not built yet: the Pi's own mic-to-text and text-to-speech loop (whisper.cpp in, Piper out, talking to
+`/ws`).

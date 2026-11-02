@@ -142,20 +142,34 @@ def test_api_requires_token_and_answers_wake_word(tmp_path):
         assert "Ryan" in llm.sent[0][0]["content"]  # persona built with owner name
 
 
-def test_tool_call_reaches_phone_over_websocket(tmp_path):
+def test_tool_call_and_reply_reach_every_client(tmp_path):
     llm = FakeLLM(
         {"content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {
-            "name": "run_shortcut", "arguments": json.dumps({"name": "Lights Off"})}}]},
-        "Lights are off.")
+            "name": "remember", "arguments": json.dumps({"text": "Ryan's sister is Maya"})}}]},
+        "Got it.")
     app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
     with TestClient(app) as c:
-        with c.websocket_connect("/ws?token=secret") as ws:
-            assert ws.receive_json()["type"] == "memory"
-            ws.send_json({"type": "utterance", "text": "Friday, lights off"})
-            assert ws.receive_json() == {"type": "heard", "text": "Friday, lights off", "addressed": True}
-            assert ws.receive_json() == {"type": "action", "kind": "url",
-                                         "url": "shortcuts://run-shortcut?name=Lights%20Off"}
-            assert ws.receive_json() == {"type": "say", "text": "Lights are off."}
+        with c.websocket_connect("/ws?token=secret") as a, c.websocket_connect("/ws?token=secret") as b:
+            a.receive_json(); b.receive_json()
+            a.send_json({"type": "utterance", "text": "Friday, my sister is Maya"})
+            for ws in (a, b):
+                assert ws.receive_json()["type"] == "heard"
+                assert ws.receive_json() == {"type": "say", "text": "Got it."}
+        assert any("Maya" in f for f in app.state.friday.memory.profile())
+
+
+def test_prompt_prefix_stays_identical_across_turns(tmp_path):
+    """Small local models live on KV-cache reuse: nothing per-turn may leak into the prefix."""
+    llm = FakeLLM("One.", "Two.")
+    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+    h = {"Authorization": "Bearer secret"}
+    with TestClient(app) as c:
+        c.post("/api/ask", json={"text": "first question"}, headers=h)
+        c.post("/api/ask", json={"text": "second question"}, headers=h)
+    first, second = llm.sent
+    assert first[0] == second[0] and "Ryan" in first[0]["content"]
+    assert second[1] == {"role": "user", "content": "first question"}  # history stays bare text
+    assert "[context]" in second[-1]["content"] and second[-1]["content"].endswith("second question")
 
 
 def test_twilio_webhook_rejects_unsigned(tmp_path):
@@ -183,54 +197,46 @@ def test_tick_speaks_each_alert_once(tmp_path):
     assert said_log == ["Reminder: stand up", "Tornado warning", "GitHub: review requested on a/b: Fix"]
 
 
-def test_glasses_frame_round_trip(tmp_path):
-    llm = FakeLLM(
-        {"content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {
-            "name": "look_through_glasses", "arguments": json.dumps({"question": "What does the sign say?"})}}]},
-        "It says EXIT.",           # vision model
-        "The sign says exit.")     # final spoken reply
-    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+def test_consolidation_digests_long_days_in_chunks(tmp_path):
+    m = Memory(str(tmp_path / "m.db"))
+    for i in range(40):
+        m.add_utterance(f"note number {i} about the garden project", speaker="owner", ts=time.time() - 100 + i)
+    llm = FakeLLM(*[json.dumps({"summary": f"part {i}."}) for i in range(10)])
+    data = asyncio.run(m.consolidate(llm, chunk_chars=500))
+    assert len(llm.sent) > 1 and all(len(s[0]["content"]) < 2000 for s in llm.sent)
+    assert data["summary"].startswith("part 0. part 1.")
+
+
+# --- presence + learning loop -------------------------------------------------------
+def test_company_holds_interruptions_and_leaving_releases_them(tmp_path):
+    app = create_app(settings(tmp_path), llm=FakeLLM(), feeds=FakeFeeds(), background=False)
+    f, h = app.state.friday, {"Authorization": "Bearer secret"}
     with TestClient(app) as c:
         with c.websocket_connect("/ws?token=secret") as ws:
-            assert ws.receive_json()["type"] == "memory"
-            ws.send_json({"type": "utterance", "text": "Friday, what does that sign say?"})
-            assert ws.receive_json()["type"] == "heard"
-            action = ws.receive_json()
-            assert action["kind"] == "glasses_frame"
-            r = c.post("/api/glasses/frame", json={"id": action["id"], "jpeg": "/9j/AAAA"},
-                       headers={"Authorization": "Bearer secret"})
-            assert r.json() == {"ok": True}
-            assert ws.receive_json() == {"type": "say", "text": "The sign says exit."}
-    vision_prompt = llm.sent[1][0]["content"]
-    assert vision_prompt[1]["image_url"]["url"].startswith("data:image/jpeg;base64,/9j/")
-    assert "Do not identify people" in vision_prompt[0]["text"]
+            ws.receive_json()
+            r = c.post("/api/presence", json={"room": "kitchen", "people": 3}, headers=h).json()
+            assert r == {"situation": "at home (kitchen) with 2 other people"}
+            asyncio.run(f.notify("github", "Review requested on a/b"))
+            asyncio.run(f.notify("reminder", "Take the bread out"))  # urgent: never held
+            assert ws.receive_json() == {"type": "notify", "kind": "reminder", "text": "Take the bread out"}
+            c.post("/api/presence", json={"room": "kitchen", "people": 1}, headers=h)
+            assert ws.receive_json() == {"type": "notify", "kind": "briefing",
+                                         "text": "Catching you up: Review requested on a/b."}
 
 
-def test_pairing_code_is_single_use_and_replies_reach_every_device(tmp_path):
-    app = create_app(settings(tmp_path), llm=FakeLLM("On it."), feeds=FakeFeeds(), background=False)
-    h = {"Authorization": "Bearer secret"}
+def test_pushback_teaches_friday_to_stop_interrupting(tmp_path):
+    llm = FakeLLM("Noted.", "Noted.", "Noted.")
+    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+    f, h = app.state.friday, {"Authorization": "Bearer secret"}
     with TestClient(app) as c:
-        assert c.post("/api/pair").status_code == 401
-        p = c.post("/api/pair", headers=h).json()
-        assert p["url"].endswith(f"/glasses/?pair={p['code']}")
-        assert c.post("/api/pair/claim", json={"code": p["code"]}).json() == {"token": "secret"}
-        assert c.post("/api/pair/claim", json={"code": p["code"]}).status_code == 403
-        assert c.post("/api/pair/claim", json={"code": "guess"}).status_code == 403
-        with c.websocket_connect("/ws?token=secret") as phone, c.websocket_connect("/ws?token=secret") as glasses:
-            phone.receive_json(); glasses.receive_json()
-            phone.send_json({"type": "utterance", "text": "Friday, start a timer"})
-            for ws in (phone, glasses):
-                assert ws.receive_json()["type"] == "heard"
-                assert ws.receive_json() == {"type": "say", "text": "On it."}
-
-
-def test_phone_screen_frames_relay_to_glasses_only(tmp_path):
-    app = create_app(settings(tmp_path), llm=FakeLLM(), feeds=FakeFeeds(), background=False)
-    with TestClient(app) as c:
-        with c.websocket_connect("/ws?token=secret") as phone, c.websocket_connect("/ws?token=secret") as glasses:
-            phone.receive_json(); glasses.receive_json()
-            phone.send_json({"type": "screen", "frame": "javascript:alert(1)"})  # not an image: dropped
-            phone.send_json({"type": "screen", "frame": "data:image/png;base64,AAAA"})
-            assert glasses.receive_json() == {"type": "screen", "frame": "data:image/png;base64,AAAA"}
-            phone.send_json({"type": "screen", "frame": None})
-            assert glasses.receive_json() == {"type": "screen", "frame": None}
+        for _ in range(2):
+            asyncio.run(f.notify("github", "Mention on a/b"))
+            c.post("/api/utterance", json={"text": "stop telling me that"}, headers=h)  # follow-up window
+        assert f.memory.taste("github") < 0.4
+        asyncio.run(f.notify("github", "Another mention"))
+        assert f.memory.notifications()[0]["text"] != "Another mention"  # held, not spoken
+        c.post("/api/utterance", json={"text": "Friday, what's up?"}, headers=h)
+        assert f.memory.notifications()[0]["text"] == "Catching you up: Another mention."
+        before = f.memory.taste("github")
+        c.post("/api/utterance", json={"text": "oh nice, which repo?"}, headers=h)  # engaged: learns up
+        assert f.memory.taste("github") > before

@@ -19,6 +19,8 @@ create table if not exists reminders(id integer primary key, due real, text text
 create table if not exists devices(addr text primary key, person text);
 create table if not exists seen(key text primary key, ts real);
 create table if not exists notifications(id integer primary key, ts real, kind text, text text);
+create table if not exists taste(kind text primary key, score real);
+create table if not exists held(id integer primary key, ts real, kind text, text text);
 """
 
 # Signals that something is worth remembering. Weights add up; tuned by eye, not science.
@@ -43,6 +45,26 @@ def importance(text):
         if re.search(pattern, low):
             score += weight
     return round(min(score, 1.0), 2)
+
+
+CONSOLIDATE = (
+    "You are the memory of a personal assistant. Below is part of today's raw transcript. "
+    "Return ONLY JSON: {\"summary\": \"2-4 sentence account\", "
+    "\"facts\": [{\"text\": \"durable fact about the owner or people in their life\", "
+    "\"category\": \"person|preference|health|work|place|commitment|other\", \"importance\": 0.0-1.0}], "
+    "\"reminders\": [{\"text\": \"...\", \"due\": \"ISO-8601 local datetime\"}]}. "
+    "Only include facts still useful in a month. Skip small talk.\n\n")
+
+
+def _chunks(lines, size):
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) > size:
+            yield chunk
+            chunk = ""
+        chunk += line[:size] + "\n"
+    if chunk:
+        yield chunk
 
 
 def _fts_query(q):
@@ -134,31 +156,54 @@ class Memory:
     def notifications(self, n=20):
         return [dict(r) for r in self.db.execute("select * from notifications order by ts desc limit ?", (n,))]
 
+    # --- the learning loop: how much the owner wants each kind of interruption --------
+    def taste(self, kind):
+        row = self.db.execute("select score from taste where kind = ?", (kind,)).fetchone()
+        return row["score"] if row else 0.6
+
+    def learn(self, kind, liked, rate=0.3):
+        """Move the score toward 1 (engaged) or 0 (pushed back). Returns the new score."""
+        score = round(self.taste(kind) + rate * ((1.0 if liked else 0.0) - self.taste(kind)), 3)
+        self.db.execute("insert or replace into taste values(?, ?)", (kind, score))
+        self.db.commit()
+        return score
+
+    def tastes(self):
+        return {r["kind"]: r["score"] for r in self.db.execute("select * from taste")}
+
+    def hold(self, kind, text):
+        self.db.execute("insert into held(ts, kind, text) values(?,?,?)", (time.time(), kind, text))
+        self.db.commit()
+
+    def release(self):
+        rows = self.db.execute("select kind, text from held order by ts").fetchall()
+        self.db.execute("delete from held")
+        self.db.commit()
+        return [(r["kind"], r["text"]) for r in rows]
+
     # --- the nightly "sleep" pass ------------------------------------------
-    async def consolidate(self, llm, model=None, now=None):
+    async def consolidate(self, llm, model=None, now=None, chunk_chars=6000):
         now = now or time.time()
         rows = self.db.execute("select * from utterances where consolidated = 0 and ts < ? order by ts",
                                (now,)).fetchall()
         if not rows:
             return None
         day = datetime.fromtimestamp(rows[0]["ts"]).strftime("%Y-%m-%d")
-        transcript = "\n".join(
-            f"{datetime.fromtimestamp(r['ts']):%H:%M} [{r['speaker']}|imp {r['importance']}] {r['text']}" for r in rows)
-        prompt = (
-            "You are the memory of a personal assistant. Below is today's raw transcript. "
-            "Return ONLY JSON: {\"summary\": \"3-6 sentence account of the day\", "
-            "\"facts\": [{\"text\": \"durable fact about the owner or people in their life\", "
-            "\"category\": \"person|preference|health|work|place|commitment|other\", \"importance\": 0.0-1.0}], "
-            "\"reminders\": [{\"text\": \"...\", \"due\": \"ISO-8601 local datetime\"}]}. "
-            "Only include facts still useful in a month. Skip small talk.\n\n" + transcript[-60000:])
-        data = parse_json(await llm.text(prompt, model=model, max_tokens=2000)) or {}
-        if data.get("summary"):
+        lines = [f"{datetime.fromtimestamp(r['ts']):%H:%M} [{r['speaker']}|imp {r['importance']}] {r['text']}"
+                 for r in rows]
+        data = {"summary": "", "facts": [], "reminders": []}
+        for chunk in _chunks(lines, chunk_chars):  # small context windows: digest the day in bites
+            part = parse_json(await llm.text(CONSOLIDATE + chunk, model=model, max_tokens=1000)) or {}
+            data["summary"] = " ".join(x for x in (data["summary"], part.get("summary") or "") if x)
+            data["facts"] += part.get("facts") or []
+            data["reminders"] += part.get("reminders") or []
+        if data["summary"]:
             self.db.execute("insert or replace into episodes values(?, coalesce((select summary from episodes "
                             "where day = ?) || ' ', '') || ?)", (day, day, data["summary"]))
-        for f in data.get("facts", []):
-            if f.get("text"):
+        for f in data["facts"]:
+            if isinstance(f, dict) and f.get("text"):
                 self.remember(f["text"], f.get("category", "other"), float(f.get("importance", 0.6)), "consolidated")
-        for r in data.get("reminders", []):
+        for r in data["reminders"]:
             try:
                 self.add_reminder(r["text"], datetime.fromisoformat(r["due"]).timestamp())
             except (KeyError, ValueError, TypeError):

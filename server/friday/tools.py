@@ -35,7 +35,7 @@ class Tools:
 
 
 def build(state):
-    """state: the app's shared objects (memory, feeds, calls, llm, settings, location, phone push)."""
+    """state: the app's shared objects (memory, feeds, calls, llm, settings, location)."""
     t, mem, feeds, s = Tools(), state.memory, state.feeds, state.settings
 
     def here():
@@ -95,39 +95,9 @@ def build(state):
             return {"error": "no such camera"}
         return {"camera": camera_id, "sees": await describe(img, question)}
 
-    @t.tool("See what the owner is looking at through their Meta glasses camera and answer a question about it "
-            "(read a sign, identify a product or landmark, translate a menu).",
-            question=("string", "what the owner wants to know"))
-    async def look_through_glasses(question):
-        img = await state.glasses_frame()
-        if not img:
-            return {"error": "glasses camera unavailable (app closed, glasses off, or permission not granted)"}
-        rule = " Do not identify people by their face; describe them only in general terms."
-        return {"sees": await describe(img, question + rule)}
-
     @t.tool("Unread GitHub notifications.")
     async def github():
         return {"notifications": (await feeds.github())[:15]}
-
-    @t.tool("Start a phone call from the owner's iPhone. iOS shows a confirm prompt before dialing.",
-            number=("string", "phone number"))
-    async def call_from_iphone(number):
-        return await state.push_phone({"kind": "url", "url": f"tel:{_digits(number)}"})
-
-    @t.tool("Open a text message on the owner's iPhone, pre-filled; the owner taps send.",
-            number=("string", "phone number"), body=("string", "message text"))
-    async def text_from_iphone(number, body):
-        from urllib.parse import quote
-        return await state.push_phone({"kind": "url", "url": f"sms:{_digits(number)}&body={quote(body)}"})
-
-    @t.tool("Run one of the owner's Apple Shortcuts on their iPhone (music, smart home, Focus, alarms, anything they've built).",
-            name=("string", "exact shortcut name"), input_=("string", "optional text input"))
-    async def run_shortcut(name, input=""):
-        from urllib.parse import quote
-        url = f"shortcuts://run-shortcut?name={quote(name)}"
-        if input:
-            url += f"&input=text&text={quote(input)}"
-        return await state.push_phone({"kind": "url", "url": url})
 
     @t.tool("Have FRIDAY phone someone in the background on the owner's behalf (book, ask, wait on hold) and report back. "
             "FRIDAY discloses it's an AI assistant.",
@@ -137,6 +107,3 @@ def build(state):
 
     return t
 
-
-def _digits(number):
-    return "".join(c for c in number if c.isdigit() or c == "+")

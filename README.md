@@ -4,31 +4,32 @@ A voice-first personal assistant that runs on your own hardware. It listens, rem
 and speaks up on its own when something needs your attention.
 
 ```
-iPhone app ──(Tailscale, WebSocket)──► home server ──► model server (Tenstorrent Blackhole / any OpenAI-compatible)
-  on-device speech-to-text               memory (SQLite + full-text search)
-  speech, Siri / Action button           brain + tools
-  Shortcuts, tel:, sms: hand-offs         proactive loop: reminders, alerts, quakes, GitHub
-                                          Twilio calls on your behalf
-                                          traffic cameras (from gods-eye-view)
+clients (pocket Pi, room sensors, anything) ──(Tailscale, WebSocket/HTTP)──► engine ──► model server
+  speech as text, presence counts                memory (SQLite + full-text search)     llama.cpp on the Pi, or
+                                                 agent loop + tools                     Tenstorrent Blackhole at home
+                                                 proactive loop + learning loop
+                                                 Twilio calls on your behalf
 ```
 
 ## What it does
 
-- **Listens all day** on the iPhone. Speech is transcribed on the phone; only text goes to your home server.
-- **Knows when you're talking to it**: the wake word ("Friday…", but not "see you Friday"), a 10-second
-  follow-up window after it speaks, and the model breaking ties when other people are around.
+- **Hears everything you send it**, and knows when you're talking to it: the wake word ("Friday…", but not
+  "see you Friday"), a 10-second follow-up window after it speaks, and the model breaking ties when
+  presence sensors say other people are around.
 - **Remembers**: every utterance gets an importance score. At 3am a "sleep" pass turns the day into a
   summary, durable facts about you, and reminders. Low-value raw text expires after `FRIDAY_RETAIN_DAYS`.
   Words from anyone who isn't you are deleted after that pass unless `FRIDAY_RECORD_OTHERS=1`.
 - **Speaks up**: due reminders, severe NWS weather alerts, magnitude 4+ quakes within 200 km, and GitHub
   review requests and mentions. Each one is said once.
-- **Uses your iPhone the Apple-supported way**: runs your Shortcuts (music, lights, Focus, alarms…),
-  starts calls (`tel:`) and pre-fills texts (`sms:`). iOS asks you to confirm calls and texts.
+- **Reads the room**: mmWave sensors report how many people are in each room. Non-urgent things wait
+  while you have company and arrive as one catch-up line when they leave.
+- **Learns what's worth interrupting you for**: pushing back ("not now", "I know") or engaging tunes each
+  kind of interruption. Kinds you don't want live wait for the next good moment instead.
+- **Small-model friendly**: the system prompt and tools never change between turns, so local servers
+  reuse their prompt cache; only a short context block is new each time.
 - **Calls people for you** through Twilio: it says it's an AI assistant, works toward the goal you gave it,
   and reports back.
 - **Looks at public traffic cameras** (NYC, London, California) and describes them with a vision model.
-- **Works with Meta glasses**: you talk and listen through them, replies show on the Ray-Ban Display lens, and
-  "what am I looking at?" uses the glasses camera. A built-in simulator covers testing without glasses.
 
 ## Run the server
 
@@ -51,39 +52,16 @@ vision model. You can point either setting at another server, including a cloud 
 
 ### Reaching it from anywhere
 
-Put the home box and the iPhone on [Tailscale](https://tailscale.com). Twilio has to reach
-`/twilio/turn` from the internet: expose only that path (e.g. Tailscale Funnel) and set `FRIDAY_PUBLIC_URL`.
-Twilio requests are checked against their signature.
-
-## Build the iPhone app
-
-You need a Mac with Xcode 15+ and an Apple developer account.
-
-```bash
-cd ios
-brew install xcodegen
-xcodegen
-open Friday.xcodeproj
-```
-
-Set your signing team, then run it on your phone. In the app's settings, enter the server URL and `FRIDAY_TOKEN`.
-"Hey Siri, ask Friday…" and the Action button (set it to the **Ask FRIDAY** shortcut) work without opening the app.
-
-Create Shortcuts with clear names ("Lights Off", "Focus Work", "Play Focus Music") and tell FRIDAY about them.
-It runs them by name.
+Put the pocket unit, the home box and the room sensors on [Tailscale](https://tailscale.com) (sensors can
+stay on the home LAN). Twilio has to reach `/twilio/turn` from the internet: expose only that path (e.g.
+Tailscale Funnel) and set `FRIDAY_PUBLIC_URL`. Twilio requests are checked against their signature.
 
 ## Known limits
 
-- iOS limits background listening. It works best with the app open, or in the background with an
-  active audio session (it plays and records, so iOS keeps it alive). Expect iOS to stop it sometimes.
-- iOS only opens Shortcuts, `tel:` and `sms:` links while the app is in the foreground. In the background
-  FRIDAY posts a notification instead.
-- The phone can't tell voices apart: speech addressed to FRIDAY is treated as yours, everything else as "unknown".
-- The iOS app hasn't been compiled yet: it was written without Xcode.
+- No voice loop on the Pi yet: speech must arrive as text (`/ws`, `/api/utterance`, `/api/ask`).
+- Voices aren't told apart: speech addressed to FRIDAY is treated as yours, everything else as "unknown".
 
 Traffic camera catalogs are ported from [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT).
 
-**Preview (no devices needed):** `preview/friday-glasses.html` is a browser simulation of the Ray-Ban Display app, live at https://claude.ai/artifact/Lsa8d5RBMuLDfZxiGtzPGR (private to the owner until shared).
-
-**Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list, the full feature list, iPhone
-testing steps, and the Meta glasses setup, including the simulator.
+**Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list (pocket Pi and presence sensors),
+why prompts are shaped the way they are, and how the learning loop decides when to speak.

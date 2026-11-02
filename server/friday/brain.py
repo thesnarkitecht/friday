@@ -1,5 +1,9 @@
 """FRIDAY's reasoning loop: builds context (profile, relevant memories, situation), lets the
-model call tools, and returns one short spoken reply."""
+model call tools, and returns one short spoken reply.
+
+Prompt layout is built for small local models: the system prompt and tool list never change, so
+llama.cpp / vLLM reuse their KV cache for that prefix and only the new turn gets processed.
+Everything that changes per turn (clock, place, memories) rides in the latest user message."""
 import json
 from datetime import datetime
 
@@ -10,15 +14,22 @@ Rules:
 - Before sending a message, placing a call, or anything that spends money or can't be undone, read back
   what you're about to do and get a clear yes, unless {owner} already said exactly what to do in this request.
 - On calls you place for {owner}, say up front that you're an AI assistant calling on their behalf.
-- Phone actions happen on {owner}'s iPhone through Shortcuts and system prompts they confirm.
+- Each message starts with a [context] block: the time, where {owner} is, and what you remember
+  that may matter. Use it quietly; never read it out."""
 
+CONTEXT = """[context]
 Now: {now}
-Where {owner} is: {where}
+Where: {where}
 Situation: {situation}
-What you know about {owner}:
-{profile}
-Possibly relevant memories:
-{recall}"""
+Known about {owner}: {profile}
+Maybe relevant: {recall}
+[/context]
+{text}"""
+
+
+def _lines(items, n, width=160):
+    """Context budget: small models choke on long prompts, so cap count and length."""
+    return "; ".join(i[:width] for i in items[:n]) or "(nothing)"
 
 
 class Brain:
@@ -26,16 +37,19 @@ class Brain:
         self.llm, self.memory, self.tools, self.owner, self.model = llm, memory, tools, owner, model
         self.history = []  # short rolling conversation; long-term lives in memory
 
-    def system_prompt(self, query, where="unknown", situation="nothing notable"):
-        return PERSONA.format(
-            owner=self.owner, now=datetime.now().astimezone().strftime("%A %B %d %Y, %H:%M %Z"),
-            where=where, situation=situation,
-            profile="\n".join(self.memory.profile()) or "(nothing yet)",
-            recall="\n".join(self.memory.search(query)) or "(nothing)")
+        self.system = PERSONA.format(owner=owner)
+
+    def with_context(self, text, where="unknown", situation="nothing notable"):
+        return CONTEXT.format(
+            owner=self.owner, now=datetime.now().astimezone().strftime("%a %b %d %Y %H:%M %Z"),
+            where=where, situation=situation, text=text,
+            profile=_lines(self.memory.profile(), 8), recall=_lines(self.memory.search(text), 4))
 
     async def respond(self, text, where="unknown", situation="nothing notable", max_steps=6):
-        self.history = (self.history + [{"role": "user", "content": text}])[-20:]
-        messages = [{"role": "system", "content": self.system_prompt(text, where, situation)}, *self.history]
+        # History keeps bare text so earlier turns stay byte-identical (cacheable) on the next call.
+        self.history = (self.history + [{"role": "user", "content": text}])[-12:]
+        messages = [{"role": "system", "content": self.system}, *self.history[:-1],
+                    {"role": "user", "content": self.with_context(text, where, situation)}]
         for _ in range(max_steps):
             msg = await self.llm.chat(messages, tools=self.tools.schemas(), model=self.model)
             calls = msg.get("tool_calls") or []
@@ -46,5 +60,5 @@ class Brain:
             messages.append({"role": "assistant", "content": msg.get("content"), "tool_calls": calls})
             for call in calls:
                 result = await self.tools.run(call["function"]["name"], call["function"].get("arguments") or "{}")
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result)[:8000]})
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result)[:3000]})
         return "I got tangled up on that one. Try me again?"

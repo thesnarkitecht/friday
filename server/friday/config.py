@@ -20,18 +20,10 @@ def load():
         keep_importance=float(e("FRIDAY_KEEP_IMPORTANCE", "0.5")),
         record_others=e("FRIDAY_RECORD_OTHERS", "0") == "1",
         github_token=e("GITHUB_TOKEN", ""),
-        # Phone control: ESP32 BLE-HID bridge + AirPlay frame dumped to disk.
-        hid_url=e("FRIDAY_HID_URL", "http://friday-hid.local"),
-        hid_token=e("FRIDAY_HID_TOKEN", ""),
-        screen_frame=e("FRIDAY_SCREEN_FRAME", "/tmp/iphone.jpg"),
-        screen_w=int(e("FRIDAY_SCREEN_W", "393")),
-        screen_h=int(e("FRIDAY_SCREEN_H", "852")),
-        mouse_scale=float(e("FRIDAY_MOUSE_SCALE", "1.0")),
         twilio_sid=e("TWILIO_ACCOUNT_SID", ""),
         twilio_token=e("TWILIO_AUTH_TOKEN", ""),
         twilio_from=e("TWILIO_FROM_NUMBER", ""),
         public_url=e("FRIDAY_PUBLIC_URL", ""),
-        motion_threshold=float(e("FRIDAY_MOTION_THRESHOLD", "2.0")),
         home_lat=float(e("FRIDAY_HOME_LAT", "0")),
         home_lon=float(e("FRIDAY_HOME_LON", "0")),
     )
