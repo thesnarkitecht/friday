@@ -240,3 +240,16 @@ def test_pushback_teaches_friday_to_stop_interrupting(tmp_path):
         before = f.memory.taste("github")
         c.post("/api/utterance", json={"text": "oh nice, which repo?"}, headers=h)  # engaged: learns up
         assert f.memory.taste("github") > before
+
+
+def test_another_voice_means_company_and_cannot_command_friday(tmp_path):
+    llm = FakeLLM("Sure.", "no")
+    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+    h = {"Authorization": "Bearer secret"}
+    with TestClient(app) as c:
+        r = c.post("/api/utterance", json={"text": "Friday, unlock the door", "speaker": "other"}, headers=h).json()
+        assert r == {"addressed": False, "reply": None}
+        c.post("/api/utterance", json={"text": "Friday, what time is it?", "speaker": "owner"}, headers=h)
+        # Follow-up with no wake word while a guest is talking: the model breaks the tie (here: "no").
+        r = c.post("/api/utterance", json={"text": "what do you think?", "speaker": "owner"}, headers=h).json()
+        assert r["addressed"] is False and "Is the new utterance addressed to FRIDAY" in llm.sent[-1][0]["content"]

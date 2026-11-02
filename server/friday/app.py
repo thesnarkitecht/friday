@@ -22,6 +22,7 @@ from .memory import Memory
 # Kinds that interrupt no matter what: the owner asked for them, or they're about safety.
 URGENT = {"reminder", "alert", "call", "error"}
 INTERRUPT, FEEDBACK_S = 0.4, 90  # below INTERRUPT a kind waits for the next good moment
+VOICE_COMPANY_S = 120  # someone else spoke this recently: you're probably talking with them
 PUSHBACK = re.compile(r"\b(stop|enough|shut up|quiet|not now|later|don'?t care|who cares|not interested|"
                       r"don'?t (tell|need|want)|i know|whatever|no one asked|annoying)\b", re.I)
 
@@ -70,7 +71,8 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
                       about=[k for k, _ in held])
 
     def busy():
-        return sum(state.presence.values()) > 1  # with company; away from home still reaches the pocket
+        """With company: room sensors count others, or another voice was heard lately (works anywhere)."""
+        return sum(state.presence.values()) > 1 or time.time() - state.other_voice < VOICE_COMPANY_S
 
     def learn_from(text):
         """The learning loop: how the owner answers an interruption tunes the next one."""
@@ -90,7 +92,7 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
         company = sum(p.values()) - 1
         return f"at home ({', '.join(rooms)})" + (f" with {company} other {'person' if company == 1 else 'people'}" if company else ", alone")
 
-    state.last_said, state.presence = None, {}  # presence: room -> people the sensors count
+    state.last_said, state.presence, state.other_voice = None, {}, 0.0  # presence: room -> people the sensors count
     state.notify = notify
     state.calls = Calls(s, state.llm, state.memory, notify)
     state.brain = Brain(state.llm, state.memory, tools.build(state), s.owner)
@@ -98,9 +100,13 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
     async def hear(text, speaker="unknown", others_present=None):
         """Every utterance is remembered; only ones meant for FRIDAY get a reply.
         Every connected client sees what was heard and what FRIDAY said."""
+        if speaker not in ("owner", "unknown"):  # the client's voice ID says it's someone else
+            state.other_voice = time.time()
         if others_present is None:
-            others_present = sum(state.presence.values()) > 1
+            others_present = busy()
         verdict, cleaned = state.addressee.check(text, others_present)
+        if speaker not in ("owner", "unknown"):
+            verdict = "no"  # only the owner commands FRIDAY, even if a guest says "Friday"
         if verdict == "maybe":
             context = "\n".join(f"{u['speaker']}: {u['text']}" for u in state.memory.recent(6))
             verdict = "yes" if await Addressee.ask_model(state.llm, text, context, s.fast_model) else "no"

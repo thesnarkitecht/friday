@@ -61,6 +61,23 @@ sensor:
               people: !lambda 'return to_string((int) x);'
 ```
 
+### Who's around you (anywhere, not just at home)
+
+The question FRIDAY needs answered is "did the owner say that, and was anyone else talking?" Voice
+answers it better than any body-worn sensor. Radar on your body sees your own limbs move, not people.
+
+| Item | Why | Cost |
+|---|---|---|
+| The lavalier mic from the pocket kit | Your voice is much louder on it than anyone else's | — |
+| Voice ID on the Pi ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker identification) | Enroll 30 s of your voice. Each utterance is tagged `owner` or `other` | free, runs offline |
+| *Optional:* throat mic, plus a 2-input USB audio adapter | It hears only you, even in a loud bar. Speech on the room mic but not the throat mic is someone else | about $25 + $15 |
+
+The client sends that tag as `speaker` with each utterance. The engine then:
+- never takes commands from another voice, even if a guest says "Friday";
+- counts you as "with company" for 2 minutes after another voice. Follow-ups without the wake word go
+  to the model to decide, and non-urgent interruptions wait;
+- forgets other people's words after the nightly pass, as before.
+
 ### Optional
 
 | Item | Why | Cost |
@@ -129,5 +146,4 @@ curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json
 | `POST /api/presence` | Room sensors |
 | `GET /api/hud` | State, recent speech, notifications, learned scores |
 
-Not built yet: the Pi's own mic-to-text and text-to-speech loop (whisper.cpp in, Piper out, talking to
-`/ws`).
+Not built yet: the Pi's own voice loop (whisper.cpp in, voice ID tag, Piper out, talking to `/ws`).
