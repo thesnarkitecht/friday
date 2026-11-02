@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "low-contrast",
+        "value": "*",
+        "files": [
+          "preview/friday-glasses.html"
+        ],
+        "createdAt": "2026-11-01T19:30:30.001Z",
+        "reason": "Claude: checker measured text against #ffffff, but this page paints body #07090c (single dark theme); flagged colors #6fd8ff and #93a1ad never sit on white"
+      }
+    ]
+  }
+}
