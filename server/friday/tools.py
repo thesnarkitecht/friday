@@ -8,13 +8,13 @@ class Tools:
     def __init__(self):
         self._fns, self._schemas = {}, []
 
-    def tool(self, description, **params):
+    def tool(self, doc, **params):
         """Register fn as a tool; params map name -> (json type, description). Names ending in '_' are optional."""
         def wrap(fn):
             props = {k.rstrip("_"): {"type": t, "description": d} for k, (t, d) in params.items()}
             required = [k for k in params if not k.endswith("_")]
             self._schemas.append({"type": "function", "function": {
-                "name": fn.__name__, "description": description,
+                "name": fn.__name__, "description": doc,
                 "parameters": {"type": "object", "properties": props, "required": required}}})
             self._fns[fn.__name__] = fn
             return fn
@@ -60,6 +60,29 @@ def build(state):
             when = when.astimezone()
         mem.add_reminder(text, when.timestamp())
         return {"reminder": text, "at": when.isoformat()}
+
+    @t.tool("Schedule something FRIDAY does on its own at a time each day, e.g. a morning briefing.",
+            at=("string", "HH:MM, 24-hour local time"), task=("string", "what to do, as you'd ask FRIDAY"),
+            days_=("string", "daily | weekdays | weekends | mon,wed,fri (default daily)"))
+    async def add_routine(at, task, days="daily"):
+        mem.add_routine(at, days, task)
+        return {"routines": mem.routines()}
+
+    @t.tool("Cancel a routine by id.", id=("integer", "routine id from add_routine"))
+    async def remove_routine(id):
+        mem.remove_routine(int(id))
+        return {"routines": mem.routines()}
+
+    @t.tool("Load a saved skill's full how-to before doing a task it covers.", name=("string", "skill name"))
+    async def skill_view(name):
+        body = state.skills.view(name)
+        return {"skill": name, "steps": body} if body else {"error": f"no skill {name}", "skills": list(state.skills.all())}
+
+    @t.tool("Save or improve a reusable how-to for a task that will come up again.",
+            name=("string", "kebab-case name"), description=("string", "one line: when to use it"),
+            body=("string", "short numbered steps naming the tools to call, plus pitfalls"))
+    async def skill_save(name, description, body):
+        return {"saved": state.skills.save(name, description, body)}
 
     @t.tool("Weather alerts and earthquakes near the owner right now.")
     async def situation():

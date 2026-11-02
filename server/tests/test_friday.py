@@ -13,6 +13,7 @@ from friday.calls import twilio_signature, twiml
 from friday.feeds import parse_caltrans, parse_nyc, parse_tfl, parse_usgs
 from friday.memory import Memory, importance
 from friday.proactive import tick
+from friday.skills import Skills
 
 
 class FakeLLM:
@@ -40,7 +41,7 @@ class FakeFeeds:
 
 def settings(tmp_path, **kw):
     s = config.load()
-    s.token, s.db, s.owner = "secret", str(tmp_path / "f.db"), "Ryan"
+    s.token, s.db, s.owner, s.skills_dir = "secret", str(tmp_path / "f.db"), "Ryan", str(tmp_path / "skills")
     s.__dict__.update(kw)
     return s
 
@@ -253,3 +254,56 @@ def test_another_voice_means_company_and_cannot_command_friday(tmp_path):
         # Follow-up with no wake word while a guest is talking: the model breaks the tie (here: "no").
         r = c.post("/api/utterance", json={"text": "what do you think?", "speaker": "owner"}, headers=h).json()
         assert r["addressed"] is False and "Is the new utterance addressed to FRIDAY" in llm.sent[-1][0]["content"]
+
+
+# --- skills + routines (ported from Hermes Agent's ideas) -----------------------------
+def test_skills_load_on_demand_and_reject_bad_names(tmp_path):
+    sk = Skills(tmp_path / "skills")
+    sk.save("order-pizza", "Ordering from Gino's", "1. call_on_my_behalf Gino's\n2. confirm total")
+    assert sk.index() == "- order-pizza: Ordering from Gino's"
+    assert "call_on_my_behalf" in sk.view("order-pizza")
+    for bad in ("../etc", "Has Space", ""):
+        with pytest.raises(ValueError):
+            sk.save(bad, "x", "y")
+    # Hermes / agentskills.io format drops straight in.
+    (tmp_path / "skills" / "obsidian").mkdir()
+    (tmp_path / "skills" / "obsidian" / "SKILL.md").write_text(
+        "---\nname: obsidian\ndescription: Read notes.\nversion: 1.0.0\nmetadata:\n  hermes:\n    tags: []\n---\n# Body")
+    assert sk.view("obsidian") == "# Body"
+
+
+def test_skill_index_is_in_the_cached_prefix_and_refreshes_only_on_purpose(tmp_path):
+    app = create_app(settings(tmp_path), llm=FakeLLM(), feeds=FakeFeeds(), background=False)
+    f = app.state.friday
+    f.skills.save("morning-brief", "What to cover in the morning", "1. situation")
+    assert "morning-brief" not in f.brain.system  # mid-day save: usable via skill_view, prefix untouched
+    f.brain.refresh()
+    assert "- morning-brief: What to cover in the morning" in f.brain.system
+
+
+def test_nightly_review_turns_tool_use_into_skills(tmp_path):
+    llm = FakeLLM(
+        {"content": None, "tool_calls": [{"id": "t1", "type": "function", "function": {
+            "name": "situation", "arguments": "{}"}}]},
+        "Clear skies.",
+        json.dumps({"skills": [{"name": "weather-check", "description": "Weather questions",
+                                "body": "1. call situation"}, {"name": "../bad", "body": "x"}]}))
+    app = create_app(settings(tmp_path), llm=llm, feeds=FakeFeeds(), background=False)
+    f = app.state.friday
+    with TestClient(app) as c:
+        c.post("/api/ask", json={"text": "how's the weather"}, headers={"Authorization": "Bearer secret"})
+    assert f.brain.worklog[0]["tools"] == ["situation({})"]
+    assert asyncio.run(f.skills.review(llm, f.brain.worklog)) == ["weather-check"]
+
+
+def test_routines_run_once_per_day_on_their_days(tmp_path):
+    from datetime import datetime
+    m = Memory(str(tmp_path / "m.db"))
+    m.add_routine("07:00", "weekdays", "brief me")
+    with pytest.raises(ValueError):
+        m.add_routine("7am", "daily", "x")
+    mon_6, mon_8, sat_8 = (datetime(2026, 11, d, h).timestamp() for d, h in ((2, 6), (2, 8), (7, 8)))
+    assert m.due_routines(mon_6) == []
+    assert m.due_routines(mon_8) == ["brief me"]
+    assert m.due_routines(mon_8 + 60) == []  # once a day
+    assert m.due_routines(sat_8) == []

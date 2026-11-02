@@ -17,10 +17,11 @@ from .calls import Calls
 from .feeds import Feeds
 from .llm import LLM
 from .memory import Memory
+from .skills import Skills
 
 
 # Kinds that interrupt no matter what: the owner asked for them, or they're about safety.
-URGENT = {"reminder", "alert", "call", "error"}
+URGENT = {"reminder", "alert", "call", "error", "routine"}
 INTERRUPT, FEEDBACK_S = 0.4, 90  # below INTERRUPT a kind waits for the next good moment
 VOICE_COMPANY_S = 120  # someone else spoke this recently: you're probably talking with them
 PUSHBACK = re.compile(r"\b(stop|enough|shut up|quiet|not now|later|don'?t care|who cares|not interested|"
@@ -34,6 +35,7 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
     state = SimpleNamespace(settings=s, location=None, clients=set())
     state.llm = llm or LLM(s.llm_base, s.llm_key, s.llm_model)
     state.memory = Memory(s.db, s.retain_days, s.keep_importance, s.record_others)
+    state.skills = Skills(s.skills_dir)
     state.feeds = feeds or Feeds(s.github_token)
     state.addressee = Addressee()
 
@@ -95,7 +97,7 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
     state.last_said, state.presence, state.other_voice = None, {}, 0.0  # presence: room -> people the sensors count
     state.notify = notify
     state.calls = Calls(s, state.llm, state.memory, notify)
-    state.brain = Brain(state.llm, state.memory, tools.build(state), s.owner)
+    state.brain = Brain(state.llm, state.memory, tools.build(state), s.owner, skills=state.skills)
 
     async def hear(text, speaker="unknown", others_present=None):
         """Every utterance is remembered; only ones meant for FRIDAY get a reply.

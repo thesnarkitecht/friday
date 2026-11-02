@@ -20,6 +20,7 @@ create table if not exists devices(addr text primary key, person text);
 create table if not exists seen(key text primary key, ts real);
 create table if not exists notifications(id integer primary key, ts real, kind text, text text);
 create table if not exists taste(kind text primary key, score real);
+create table if not exists routines(id integer primary key, at text, days text, task text, last_day text);
 create table if not exists held(id integer primary key, ts real, kind text, text text);
 """
 
@@ -65,6 +66,9 @@ def _chunks(lines, size):
         chunk += line[:size] + "\n"
     if chunk:
         yield chunk
+
+
+_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 def _fts_query(q):
@@ -155,6 +159,37 @@ class Memory:
 
     def notifications(self, n=20):
         return [dict(r) for r in self.db.execute("select * from notifications order by ts desc limit ?", (n,))]
+
+    # --- routines: tasks the owner scheduled in plain words -----------------
+    def add_routine(self, at, days, task):
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+            raise ValueError("at must be HH:MM, 24-hour")
+        days = days.lower().replace(" ", "")
+        if days not in ("daily", "weekdays", "weekends") and not set(days.split(",")) <= set(_DAYS):
+            raise ValueError("days: daily, weekdays, weekends, or a list like mon,wed,fri")
+        cur = self.db.execute("insert into routines(at, days, task) values(?,?,?)", (at, days, task))
+        self.db.commit()
+        return cur.lastrowid
+
+    def routines(self):
+        return [dict(r) for r in self.db.execute("select id, at, days, task from routines order by at")]
+
+    def remove_routine(self, rid):
+        self.db.execute("delete from routines where id = ?", (rid,))
+        self.db.commit()
+
+    def due_routines(self, now=None):
+        """Routines whose time has come today and haven't run today. Marks them run."""
+        t = datetime.fromtimestamp(now or time.time())
+        day, today = _DAYS[t.weekday()], t.strftime("%Y-%m-%d")
+        due = []
+        for r in self.db.execute("select * from routines").fetchall():
+            on = {"daily": _DAYS, "weekdays": _DAYS[:5], "weekends": _DAYS[5:]}.get(r["days"], r["days"].split(","))
+            if day in on and t.strftime("%H:%M") >= r["at"] and r["last_day"] != today:
+                self.db.execute("update routines set last_day = ? where id = ?", (today, r["id"]))
+                due.append(r["task"])
+        self.db.commit()
+        return due
 
     # --- the learning loop: how much the owner wants each kind of interruption --------
     def taste(self, kind):

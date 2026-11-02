@@ -25,6 +25,10 @@ clients (pocket Pi, room sensors, anything) ──(Tailscale, WebSocket/HTTP)─
   while you have company and arrive as one catch-up line when they leave.
 - **Learns what's worth interrupting you for**: pushing back ("not now", "I know") or engaging tunes each
   kind of interruption. Kinds you don't want live wait for the next good moment instead.
+- **Learns how to do things**: skills are `SKILL.md` how-tos (the Hermes Agent / agentskills.io format).
+  Only a one-line index sits in the prompt; the steps load when needed. Each night FRIDAY reviews what
+  it did with tools and writes or fixes skills.
+- **Routines**: "every weekday at 7, brief me." FRIDAY does the task on schedule and tells you.
 - **Small-model friendly**: the system prompt and tools never change between turns, so local servers
   reuse their prompt cache; only a short context block is new each time.
 - **Calls people for you** through Twilio: it says it's an AI assistant, works toward the goal you gave it,
@@ -61,7 +65,10 @@ Tailscale Funnel) and set `FRIDAY_PUBLIC_URL`. Twilio requests are checked again
 - No voice loop on the Pi yet: speech must arrive as text (`/ws`, `/api/utterance`, `/api/ask`).
 - Voices aren't told apart: speech addressed to FRIDAY is treated as yours, everything else as "unknown".
 
+Skills and progressive disclosure are adapted from [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research (MIT).
 Traffic camera catalogs are ported from [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT).
+
+**How it works:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (diagrams).
 
 **Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list (pocket Pi and presence sensors),
 why prompts are shaped the way they are, and how the learning loop decides when to speak.

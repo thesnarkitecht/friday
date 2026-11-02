@@ -10,6 +10,7 @@ def load():
         token=e("FRIDAY_TOKEN", ""),
         owner=e("FRIDAY_OWNER_NAME", "the owner"),
         db=e("FRIDAY_DB", "friday.db"),
+        skills_dir=e("FRIDAY_SKILLS_DIR", "skills"),
         # Any OpenAI-compatible server: tt-inference-server (vLLM) on the Blackhole box by default.
         llm_base=e("FRIDAY_LLM_BASE_URL", "http://localhost:8000/v1"),
         llm_key=e("FRIDAY_LLM_API_KEY", "none"),

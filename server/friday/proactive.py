@@ -30,6 +30,11 @@ async def tick(state, now=None):
                 said.append(("github", f"GitHub: {n['reason'].replace('_', ' ')} on {n['repo']}: {n['title']}"))
     except Exception:
         pass
+    for task in state.memory.due_routines(now):  # owner-scheduled: FRIDAY does the task, then says it
+        try:
+            said.append(("routine", await state.brain.respond(f"(Scheduled routine, nobody asked just now.) {task}")))
+        except Exception as e:
+            said.append(("error", f"Routine '{task}' failed: {type(e).__name__}"))
     for kind, text in said:
         await state.notify(kind, text)
     return said
@@ -44,6 +49,10 @@ async def run(state, every_s=120):
             last_sleep_day = today.date()
             try:
                 await state.memory.consolidate(state.llm, model=state.settings.fast_model)
+                # The skill half of the learning loop: turn today's tool use into reusable how-tos.
+                worklog, state.brain.worklog = state.brain.worklog, []
+                await state.skills.review(state.llm, worklog, model=state.settings.fast_model)
+                state.brain.refresh()  # the one daily moment the cached prompt prefix changes
             except Exception as e:
-                await state.notify("error", f"Memory consolidation failed: {e}")
+                await state.notify("error", f"Nightly memory/skill pass failed: {e}")
         await asyncio.sleep(every_s)
