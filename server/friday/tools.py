@@ -47,6 +47,18 @@ def build(state):
     async def forget(text):
         return {"forgot": mem.forget(text)}
 
+    @t.tool("How things in the owner's world connect: projects, tools, topics, places, orgs, people.",
+            entity_=("string", "what to look around; empty for the strongest links overall"))
+    async def graph(entity=""):
+        return mem.graph(entity or None, depth=2 if entity else 1, limit=40)
+
+    @t.tool("Add a connection to the owner's map, e.g. ('me', 'works on', 'FRIDAY') or ('FRIDAY', 'uses', 'Rust').",
+            subject=("string", "use 'me' for the owner"), relation=("string", "short verb phrase"),
+            object=("string", "the other thing"))
+    async def connect(subject, relation, object):
+        mem.link(subject, relation, object)
+        return {"linked": [subject, relation, object]}
+
     @t.tool("Search everything FRIDAY has heard, been told, or summarized.", query=("string", "what to look for"))
     async def recall(query):
         return {"results": mem.search(query, n=10)}

@@ -14,7 +14,7 @@ flowchart TB
     end
 
     subgraph SERVER["FRIDAY engine (same process, or a shared hub)"]
-        stt["Whisper<br/>speech → text"]
+        stt["SenseVoice<br/>speech → text + how it sounded"]
         tts["Piper<br/>text → speech"]
         hear["hear()<br/>score + remember every line"]
         who{"Meant for FRIDAY?<br/>wake word · 10 s follow-up<br/>alone + sounds like a request → Claude decides (typed)<br/>other voice → never"}

@@ -494,15 +494,15 @@ def test_no_claude_credentials_at_all_is_spoken(tmp_path, monkeypatch, empty_pro
 
 # --- any device with headphones ----------------------------------------------------------
 class FakeVoice:
-    def __init__(self):
-        self.heard = []
+    def __init__(self, tone=None):
+        self.heard, self.tone = [], tone
 
     def available(self):
         return True
 
     def transcribe(self, pcm):
         self.heard.append(len(pcm))
-        return "Friday, did a new model drop?"
+        return "Friday, did a new model drop?", self.tone
 
     def speak(self, text):
         return b"RIFF" + text.encode()
@@ -680,3 +680,198 @@ def test_a_reply_to_a_check_in_has_context(tmp_path):
     msgs = llm.sent[0]["messages"]
     assert msgs[0]["role"] == "user"  # the API's rule, kept without losing FRIDAY's question
     assert msgs[-2] == {"role": "assistant", "content": "How did the interview go?"}
+
+
+
+def test_friday_hears_how_you_said_it(tmp_path):
+    import base64
+    from friday.voice import heard_as
+    assert heard_as("<|ANGRY|>", "<|Laughter|>") == "sounded frustrated, laughing"
+    assert heard_as("<|NEUTRAL|>", "<|Speech|>") is None
+    llm = FakeLLM("Rough one. Want me to dig into it?")
+    app = create_app(settings(tmp_path), llm=llm, background=False, voice=FakeVoice(tone="sounded frustrated"))
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "hello", "voice": True}); ws.receive_json()
+        ws.send_json({"type": "audio", "pcm": base64.b64encode(b"\0" * 3200).decode()})
+        ws.receive_json(); until_said(ws)
+    assert "Ryan sounded frustrated as they said this" in llm.sent[0]["messages"][-1]["content"]
+    assert app.state.friday.memory.recent(2)[0]["text"].endswith("[sounded frustrated]")
+
+
+
+def test_linux_without_portaudio_uses_the_systems_own_recorder_and_player(tmp_path, monkeypatch):
+    """No sudo needed: when PortAudio is missing, FRIDAY records and plays with parec/paplay or arecord/aplay."""
+    import shutil
+    import numpy as np
+    from friday.cli import SystemSound
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "arecord").write_text(f"#!/bin/sh\n{shutil.which('head')} -c 96000 /dev/zero\n")  # 3 s of silence
+    (bin_ / "aplay").write_text(f"#!/bin/sh\n{shutil.which('sleep')} 5\n")
+    for f in bin_.iterdir():
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_))
+    sd = SystemSound()
+    assert sd.rec[0] == "arecord" and sd.player == ["aplay", "-q"]
+    got = []
+    with sd.RawInputStream(samplerate=16000, blocksize=480, callback=lambda d, n, t, s: got.append(len(d))):
+        deadline = time.time() + 5
+        while len(got) < 100 and time.time() < deadline:
+            time.sleep(0.01)
+    assert len(got) >= 100 and set(got) == {960}
+    sd.play(np.zeros(16000, np.int16), 16000)
+    assert sd.get_stream().active
+    sd.stop()  # barge-in
+    time.sleep(0.2)
+    assert not sd.get_stream().active and sd.wav is None
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing"))
+    with pytest.raises(RuntimeError, match="libportaudio2"):
+        SystemSound()
+
+
+# --- any OpenAI-compatible brain -----------------------------------------------------------------
+def test_any_openai_compatible_api_can_be_friday_s_brain(tmp_path):
+    from friday.addressee import Addressed
+    from friday.llm import OpenAICompat
+    seen = []
+
+    def sse(*chunks):
+        body = "".join(f"data: {json.dumps({'choices': [c]})}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    def server(request):
+        body = json.loads(request.content)
+        seen.append(body)
+        if "response_format" in body:
+            return httpx.Response(400, json={"error": "response_format not supported"})
+        if body["messages"][0]["content"].startswith("A voice assistant"):  # decide(), plain JSON fallback
+            return httpx.Response(200, json={"choices": [{"message": {"content": 'Sure: {"addressed": true}'}}]})
+        if not any(m["role"] == "tool" for m in body["messages"]):  # first turn: a tool call, streamed in pieces
+            return sse({"delta": {"content": "Saving that. "}},
+                       {"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "remember",
+                                                                                         "arguments": '{"text": "Ru'}}]}},
+                       {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'st", "category": "interest"}'}}]}},
+                       {"delta": {}, "finish_reason": "tool_calls"})
+        return sse({"delta": {"content": "Got it. Rust it is."}}, {"delta": {}, "finish_reason": "stop"})
+
+    llm = OpenAICompat("http://ollama:11434/v1", "", "llama3.3",
+                       http=httpx.AsyncClient(transport=httpx.MockTransport(server)))
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "ask", "text": "I'm into Rust"}); ws.receive_json()
+        parts, say = until_said(ws)
+    assert [p["text"] for p in parts] == ["Saving that.", "Got it.", "Rust it is."]
+    assert app.state.friday.memory.interests() == ["Rust"]
+    tool_turn = seen[1]["messages"]
+    assert tool_turn[-2]["tool_calls"][0]["function"]["name"] == "remember"
+    assert tool_turn[-1]["role"] == "tool" and tool_turn[-1]["tool_call_id"] == "call_1"
+    assert seen[0]["tools"][0]["type"] == "function" and seen[0]["model"] == "llama3.3"
+    assert asyncio.run(llm.decide("A voice assistant… addressed?", Addressed)).addressed is True
+
+
+# --- your data: export / import / learn, and the graph ----------------------------------------------
+def test_export_then_import_moves_friday_to_a_new_machine(tmp_path, monkeypatch, capsys):
+    from friday import cli
+    a = create_app(settings(tmp_path / "a"), llm=FakeLLM(), background=False).state.friday
+    a.memory.remember("Rust", "interest")
+    a.memory.add_routine("07:30", "weekdays", "brief me")
+    a.memory.link("me", "works on", "FRIDAY", "person", "project")
+    a.memory.link("FRIDAY", "uses", "SenseVoice", "project", "tool")
+    a.skills.save("order-coffee", "Ordering the usual", "1. recall the usual\n2. confirm")
+    out = tmp_path / "friday.json"
+    app_b = create_app(settings(tmp_path / "b"), llm=FakeLLM(), background=False)
+    with TestClient(create_app(settings(tmp_path / "a"), llm=FakeLLM(), background=False), headers=H) as ca:
+        monkeypatch.setattr(cli, "client", lambda **kw: ca)
+        cli.main(["export", str(out)])
+    assert oct(out.stat().st_mode & 0o777) == "0o600"
+    with TestClient(app_b, headers=H) as cb:
+        monkeypatch.setattr(cli, "client", lambda **kw: cb)
+        cli.main(["import", str(out)])
+    assert "Imported" in capsys.readouterr().out
+    b = app_b.state.friday
+    assert b.memory.interests() == ["Rust"] and b.memory.routines()[0]["task"] == "brief me"
+    assert {(e["from"], e["to"]) for e in b.memory.graph()["edges"]} == {("me", "FRIDAY"), ("FRIDAY", "SenseVoice")}
+    assert "- order-coffee: Ordering the usual" in b.brain.system  # skills land in the prompt index
+
+
+def test_import_checks_everything_it_is_given(tmp_path):
+    f = create_app(settings(tmp_path), llm=FakeLLM(), background=False).state.friday
+    with pytest.raises(ValueError):
+        f.memory.import_({"facts": []}, f.skills)  # not an export
+    n = f.memory.import_({"friday_export": 1, "facts": [{"text": "ok"}, "junk", {"text": ""}],
+                          "routines": [{"at": "25:99", "days": "daily", "task": "x"}],
+                          "episodes": [{"day": "'; drop table facts; --", "summary": "x"}],
+                          "skills": {"../../etc/passwd": "---\nname: x\n---\nboom", "fine": "---\ndescription: d\n---\nok"},
+                          "taste": {"hn": 99}}, f.skills)
+    assert n["facts"] == 1 and n["routines"] == 0 and n["episodes"] == 0 and n["skills"] == 1
+    assert not (tmp_path / "etc").exists() and f.memory.taste("hn") == 1
+
+
+def test_friday_learns_from_any_notes_file(tmp_path, monkeypatch, capsys):
+    from friday import cli
+    notes = tmp_path / "notes.md"
+    notes.write_text("# Me\nI build voice assistants in Python.\nTrying to switch FRIDAY to SenseVoice.\n")
+    llm = FakeLLM({"summary": "", "facts": [{"text": "Builds voice assistants in Python", "category": "work",
+                                             "importance": 0.8}], "reminders": [],
+                   "links": [{"subject": "me", "relation": "builds", "object": "voice assistants"}]})
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    with TestClient(app, headers=H) as c:
+        monkeypatch.setattr(cli, "client", lambda **kw: c)
+        cli.main(["import", str(notes)])
+    assert "Learned 1 facts, 0 reminders and 1 links" in capsys.readouterr().out
+    assert "I build voice assistants in Python." in llm.sent[0]["prompt"]
+
+
+def test_the_graph_grows_and_renders(tmp_path, monkeypatch, capsys):
+    from friday import cli
+    llm = FakeLLM(use("connect", subject="FRIDAY", relation="uses", object="Rust"), "Noted.")
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    m = app.state.friday.memory
+    m.link("me", "works on", "FRIDAY", "person", "project")
+    m.link("me", "works on", "FRIDAY")  # mentioned again: stronger
+    m.link("Paris", "is", "Paris")  # self-loops are noise
+    with TestClient(app, headers=H) as c:
+        c.post("/api/ask", json={"text": "FRIDAY is written in Rust now"})
+        monkeypatch.setattr(cli, "client", lambda **kw: c)
+        cli.main(["graph"])
+        text = capsys.readouterr().out
+        cli.main(["graph", "Rust", "--depth", "2", "--format", "mermaid"])
+        mer = capsys.readouterr().out
+        cli.main(["graph", "--format", "dot"])
+        dot = capsys.readouterr().out
+    assert "works on" in text and "×2" in text and "Paris" not in text
+    assert mer.startswith("graph LR") and '"uses"' in mer and '"works on"' in mer  # depth 2 reaches "me"
+    assert dot.startswith("digraph") and '"FRIDAY" -> "Rust" [label="uses"]' in dot
+
+
+def test_settings_are_driven_from_the_cli(tmp_path, monkeypatch, capsys):
+    import stat
+    from friday import cli
+    monkeypatch.setattr(cli, "ENV", str(tmp_path / ".env"))
+    monkeypatch.setattr(cli, "HOME", tmp_path)
+    monkeypatch.setattr(cli, "CONFIG", str(tmp_path / "config.json"))
+    cli.main(["config", "set", "friday_llm_url", "http://localhost:11434/v1"])
+    cli.main(["config", "set", "FRIDAY_LLM_KEY", "sk-very-secret-value"])
+    cli.main(["config", "set", "FRIDAY_MODEL", "llama3.3"])
+    cli.main(["config", "unset", "FRIDAY_MODEL"])
+    capsys.readouterr()
+    cli.main(["config"])
+    out = capsys.readouterr().out
+    assert "FRIDAY_LLM_URL=http://localhost:11434/v1" in out and "sk-v…" in out and "secret" not in out
+    assert "FRIDAY_MODEL" not in out and stat.S_IMODE((tmp_path / ".env").stat().st_mode) == 0o600
+    with pytest.raises(SystemExit):
+        cli.main(["config", "set", "BAD KEY;rm", "x"])
+
+
+def test_doctor_reports_what_works(tmp_path, monkeypatch, capsys):
+    from friday import cli
+    app = create_app(settings(tmp_path), llm=FakeLLM("OK"), background=False, voice=FakeVoice())
+    with TestClient(app, headers=H) as c:
+        assert c.get("/api/doctor").json()["brain"] == "ok"
+        monkeypatch.setattr(cli, "client", lambda **kw: c)
+        monkeypatch.setattr(cli, "sound", lambda: (_ for _ in ()).throw(RuntimeError("no mic here")))
+        cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "Mic: no mic here" in out and "Brain: claude-opus-5-5 via Claude" in out and "Ears and voice" in out

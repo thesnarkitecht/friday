@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 from . import config, plugins, proactive, tools
 from .addressee import Addressee
 from .brain import Brain
-from .llm import Claude
+from .llm import Claude, OpenAICompat, Unavailable
 from .memory import SEED_QUESTIONS, Memory
 from .skills import Skills
 from .voice import Voice
@@ -39,9 +39,9 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     if not s.token:
         raise RuntimeError("Set FRIDAY_TOKEN: the server holds your life, it doesn't run unauthenticated.")
     state = SimpleNamespace(settings=s, clients=set(), voice_clients=set())
-    state.voice = voice or Voice(piper_path=s.voice_path)
+    state.voice = voice or Voice(piper_path=s.voice_path, models_dir=s.models_dir)
     state.turn_lock, state.tasks, state.hush = asyncio.Lock(), set(), False
-    state.llm = llm or Claude(s.model)
+    state.llm = llm or (OpenAICompat(s.llm_url, s.llm_key, s.model) if s.llm_url else Claude(s.model))
     state.http = http or httpx.AsyncClient(timeout=20, headers={"User-Agent": "friday-assistant"})
     Path(s.db).parent.mkdir(parents=True, exist_ok=True)
     state.memory = Memory(s.db, s.retain_days, s.keep_importance, s.record_others)
@@ -139,7 +139,7 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     state.plugins, state.plugin_errors = plugins.load(s.plugin_roots, state, registry)
     state.brain = Brain(state.llm, state.memory, registry, s.owner, skills=state.skills)
 
-    async def hear(text, speaker="unknown", others_present=None):
+    async def hear(text, speaker="unknown", others_present=None, tone=None):
         """Every utterance is remembered; only ones meant for FRIDAY get a reply.
         Every connected client sees what was heard and what FRIDAY said."""
         if speaker not in ("owner", "unknown"):  # the client's voice ID says it's someone else
@@ -153,14 +153,15 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
             context = "\n".join(f"{u['speaker']}: {u['text']}" for u in state.memory.recent(6))
             verdict = "yes" if await Addressee.ask_model(state.llm, text, context) else "no"
         addressed = verdict == "yes"
-        state.memory.add_utterance(text, speaker="owner" if addressed and speaker == "unknown" else speaker,
+        state.memory.add_utterance(text + (f" [{tone}]" if tone else ""),  # tone helps spot patterns
+                                   speaker="owner" if addressed and speaker == "unknown" else speaker,
                                    addressed=addressed)
         await broadcast({"type": "heard", "text": text, "addressed": addressed})
         if not addressed:
             return None
-        return (await converse(cleaned))[0]
+        return (await converse(cleaned, tone))[0]
 
-    async def converse(cleaned):
+    async def converse(cleaned, tone=None):
         """The owner said something to FRIDAY (by voice, CLI or an OpenAI client). Returns the reply and
         any catch-up line delivered with it."""
         state.last_owner = time.time()
@@ -168,12 +169,12 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
         if state.pending_question and time.time() - state.pending_question[1] < ANSWER_S:
             state.memory.answer(state.pending_question[0], cleaned)
         state.pending_question = None
-        reply = await respond_aloud(cleaned)
+        reply = await respond_aloud(cleaned, tone)
         await broadcast({"type": "memory", "facts": state.memory.profile()})
         catch_up = None if busy() else await brief()  # the owner is engaged anyway: a good moment
         return reply, catch_up
 
-    async def respond_aloud(prompt):
+    async def respond_aloud(prompt, tone=None):
         """Ask the brain and speak the answer sentence by sentence as it's written."""
         state.hush, pending, spoken = False, [""], [0]
 
@@ -189,7 +190,8 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
                 spoken[0] += 1
                 await broadcast({"type": "say_part", "text": text})
 
-        reply = await state.brain.respond(prompt, situation=situation(), on_text=on_text)
+        heard = situation() + (f"; {s.owner} {tone} as they said this" if tone else "")
+        reply = await state.brain.respond(prompt, situation=heard, on_text=on_text)
         await say_part(pending[0].strip())
         state.memory.add_utterance(reply, speaker="friday", addressed=True)
         state.addressee.spoke()
@@ -232,9 +234,9 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
         await converse(text)
 
     async def spoken_in(pcm, speaker):
-        text = await asyncio.to_thread(state.voice.transcribe, pcm)
+        text, tone = await asyncio.to_thread(state.voice.transcribe, pcm)
         if text:
-            await hear(text, speaker)
+            await hear(text, speaker, tone=tone)
 
     def turn(coro):
         """Run a turn in the background, one at a time, so the socket stays free for "interrupt"."""
@@ -346,6 +348,47 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
         return {"id": cid, "object": "chat.completion", "created": now, "model": "friday",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+    @app.get("/api/export", dependencies=[Depends(auth)])
+    async def export(transcripts: bool = False):
+        return state.memory.export(state.skills, transcripts)
+
+    @app.post("/api/import", dependencies=[Depends(auth)])
+    async def import_(body: dict):
+        try:
+            counts = state.memory.import_(body, state.skills)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        state.brain.refresh()  # imported skills join the index
+        return counts
+
+    @app.post("/api/learn", dependencies=[Depends(auth)])
+    async def learn(body: dict):
+        """Learn from any document: notes, an exported chat history, a bio."""
+        text = str(body.get("text", ""))[:2_000_000]
+        if not text.strip():
+            raise HTTPException(400, 'Send {"text": "..."}')
+        try:
+            return await state.memory.learn_document(state.llm, text)
+        except Unavailable as e:
+            raise HTTPException(503, str(e))
+
+    @app.get("/api/graph", dependencies=[Depends(auth)])
+    async def graph(entity: str = "", depth: int = 1):
+        return state.memory.graph(entity or None, depth=max(1, min(depth, 3)), limit=200)
+
+    @app.get("/api/doctor", dependencies=[Depends(auth)])
+    async def doctor():
+        """Is everything working? Asks the brain for one word, and checks speech and plugins."""
+        try:
+            r = await state.llm.chat("Reply with exactly: OK", [{"role": "user", "content": "Are you there?"}],
+                                     max_tokens=200)
+            brain = "ok" if r["text"] else "answered with nothing"
+        except Unavailable as e:
+            brain = str(e)
+        return {"brain": brain, "model": s.model or "(not set)", "via": s.llm_url or "Claude",
+                "speech": await asyncio.to_thread(state.voice.available), "plugins": [p.name for p in state.plugins],
+                "plugin_errors": state.plugin_errors}
 
     @app.post("/api/forget", dependencies=[Depends(auth)])
     async def forget(body: dict):

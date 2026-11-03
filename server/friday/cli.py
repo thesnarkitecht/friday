@@ -11,9 +11,11 @@ FRIDAY_URL and FRIDAY_TOKEN override the saved login."""
 import argparse
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import sys
+import wave
 
 import httpx
 
@@ -84,9 +86,9 @@ def start_here(background, host="127.0.0.1", port=0):
     for skill in (config.PACKAGE / "starter_skills").iterdir():  # starters; never overwrite FRIDAY's own edits
         if not os.path.exists(os.path.join(s.skills_dir, skill.name)):
             shutil.copytree(skill, os.path.join(s.skills_dir, skill.name))
-    voice = Voice(piper_path=s.voice_path)
+    voice = Voice(piper_path=s.voice_path, models_dir=s.models_dir)
     if not voice.available():
-        print(f"{DIM}Getting FRIDAY's voice ready (one-time download)…{OFF}", flush=True)
+        print(f"{DIM}Getting FRIDAY's ears and voice ready (one-time download, about 300 MB)…{OFF}", flush=True)
         if not voice.ensure(s.voice):
             print(f"{YELLOW}Couldn't download the voice; FRIDAY will answer in text.{OFF}")
     if not port:
@@ -273,8 +275,87 @@ class Segmenter:
         return None
 
 
+class SystemSound:
+    """Linux without PortAudio: the recorder and player the system already has (PulseAudio/PipeWire or
+    ALSA), so installing FRIDAY never needs sudo. Offers the few sounddevice calls FRIDAY uses."""
+
+    def __init__(self):
+        import shutil
+        self.rec = (["parec", "--raw", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=30"]
+                    if shutil.which("parec") else
+                    ["arecord", "-q", "-f", "S16_LE", "-r", str(RATE), "-c", "1", "-t", "raw"]
+                    if shutil.which("arecord") else None)
+        self.player = ["paplay"] if shutil.which("paplay") else ["aplay", "-q"] if shutil.which("aplay") else None
+        if not self.rec or not self.player:
+            raise RuntimeError("No way to use the mic here: install PortAudio (libportaudio2) or "
+                               "PulseAudio/ALSA tools (pulseaudio-utils or alsa-utils).")
+        self.proc, self.wav = None, None
+
+    def check_input_settings(self, **kw):
+        pass  # the recorder delivers 16 kHz mono itself
+
+    def query_devices(self, device=None, kind=None):
+        return {"name": f"the system default ({self.rec[0]})", "default_samplerate": RATE}
+
+    def RawInputStream(self, samplerate, blocksize, callback, **kw):
+        import contextlib
+        import subprocess
+        import threading
+
+        @contextlib.contextmanager
+        def stream():
+            proc = subprocess.Popen(self.rec, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+            def pump():
+                while (data := proc.stdout.read(blocksize * 2)) and len(data) == blocksize * 2:
+                    callback(data, blocksize, None, None)
+            threading.Thread(target=pump, daemon=True).start()
+            try:
+                yield self
+            finally:
+                proc.terminate()
+        return stream()
+
+    def play(self, pcm, rate, device=None):
+        import subprocess
+        import tempfile
+        self.stop()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f, wave.open(f, "wb") as w:
+            w.setnchannels(1), w.setsampwidth(2), w.setframerate(rate), w.writeframes(pcm.tobytes())
+        self.wav = f.name
+        self.proc = subprocess.Popen(self.player + [self.wav], stderr=subprocess.DEVNULL)
+
+    def get_stream(self):
+        return self
+
+    @property
+    def active(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        if self.active:
+            self.proc.terminate()
+        if self.wav:
+            with contextlib.suppress(OSError):
+                os.remove(self.wav)
+            self.wav = None
+
+
+def sound():
+    """sounddevice when PortAudio is there (always on macOS/Windows), else the system's own tools."""
+    try:
+        import sounddevice
+        return sounddevice
+    except OSError:  # Linux without libportaudio2
+        return SystemSound()
+
+
 def cmd_devices(c, a):
-    import sounddevice as sd
+    sd = sound()
+    if isinstance(sd, SystemSound):
+        print(f"Using {sd.query_devices()['name']} for the mic and {sd.player[0]} for sound. Pick devices in your "
+              "system sound settings (install libportaudio2 to choose them here instead).")
+        return
     print(sd.query_devices())
     print(f"{DIM}Defaults are marked > (in) and < (out). Pick others with friday --mic N --speaker N.{OFF}")
 
@@ -286,13 +367,12 @@ def cmd_listen(c, a):
     """Voice mode: this device's mic (your paired headphones) is FRIDAY's ears; its speaker is FRIDAY's voice."""
     import collections
     import io
-    import wave
 
     import numpy as np
-    import sounddevice as sd
     import webrtcvad
     import websockets
 
+    sd = sound()
     vad, strict = webrtcvad.Vad(a.vad), webrtcvad.Vad(3)  # stricter while FRIDAY talks: ignore leakage
     speaking, cut = asyncio.Event(), asyncio.Event()
 
@@ -390,6 +470,173 @@ def cmd_listen(c, a):
         print()
 
 
+# --- your data -------------------------------------------------------------------------------
+def private_write(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # it's your life: only you can read it
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def cmd_export(c, a):
+    from datetime import date
+    data = call(c, "GET", "/api/export", params={"transcripts": a.transcripts})
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    if a.path == "-":
+        print(text)
+        return
+    path = a.path or f"friday-export-{date.today():%Y%m%d}.json"
+    private_write(path, text)
+    print(f"Saved {len(data['facts'])} facts, {len(data['links'])} links and {len(data['skills'])} skills "
+          f"to {path}.")
+
+
+def cmd_import(c, a):
+    try:
+        with open(a.path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        sys.exit(f"Can't read {a.path}: {e.strerror}")
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and data.get("friday_export"):
+        n = call(c, "POST", "/api/import", json=data)
+        print("Imported " + ", ".join(f"{v} {k}" for k, v in n.items() if v) + ".")
+    else:  # notes, a chat export, a bio: FRIDAY reads it and keeps what matters
+        print(f"{DIM}Reading {a.path}…{OFF}", flush=True)
+        n = call(c, "POST", "/api/learn", json={"text": text})
+        print(f"Learned {n['facts']} facts, {n['reminders']} reminders and {n['links']} links from {a.path}.")
+
+
+def mermaid(g):
+    ids = {n["name"]: f"n{i}" for i, n in enumerate(g["nodes"])}
+    q = lambda t: str(t).replace('"', "'")  # noqa: E731
+    return "\n".join(["graph LR"] + [f'  {ids[n["name"]]}["{q(n["name"])}"]' for n in g["nodes"]]
+                     + [f'  {ids[e["from"]]} -- "{q(e["rel"])}" --> {ids[e["to"]]}' for e in g["edges"]])
+
+
+def dot(g):
+    q = lambda t: json.dumps(str(t))  # noqa: E731
+    return "\n".join(["digraph friday {", "  rankdir=LR;"]
+                     + [f'  {q(e["from"])} -> {q(e["to"])} [label={q(e["rel"])}];' for e in g["edges"]] + ["}"])
+
+
+def cmd_graph(c, a):
+    g = call(c, "GET", "/api/graph", params={"entity": " ".join(a.entity), "depth": a.depth})
+    if a.format == "json":
+        print(json.dumps(g, indent=2, ensure_ascii=False))
+    elif a.format == "mermaid":
+        print(mermaid(g))
+    elif a.format == "dot":
+        print(dot(g))
+    elif not g["edges"]:
+        print("  (nothing mapped yet: FRIDAY builds this as you talk, and every night)")
+    else:
+        kinds = {n["name"]: n["kind"] for n in g["nodes"]}
+        for e in sorted(g["edges"], key=lambda e: -e["weight"]):
+            tag = lambda n: f"{n} {DIM}({kinds.get(n, 'other')}){OFF}" if kinds.get(n, "other") != "other" else n  # noqa: E731
+            print(f"  {tag(e['from'])} {CYAN}─{e['rel']}→{OFF} {tag(e['to'])}" + (f" {DIM}×{e['weight']}{OFF}"
+                                                                                 if e["weight"] > 1 else ""))
+
+
+# --- settings, setup, health --------------------------------------------------------------------
+ENV = str(HOME / ".env")
+SECRET = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+
+
+def env_lines():
+    try:
+        with open(ENV, encoding="utf-8") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def set_env(key, value):
+    """Set (or with value None, remove) one setting in ~/.friday/.env, keeping everything else."""
+    key = key.strip().upper()
+    if not key.replace("_", "").isalnum():
+        sys.exit(f"Not a setting name: {key}")
+    lines = [ln for ln in env_lines() if ln.split("=", 1)[0].strip() != key]
+    if value is not None:
+        lines.append(f"{key}={value}")
+    os.makedirs(HOME, exist_ok=True)
+    private_write(ENV, "\n".join(lines) + "\n")
+
+
+def cmd_config(a):
+    if a.action == "set":
+        if len(a.args) < 2:
+            sys.exit("Usage: friday config set NAME VALUE")
+        set_env(a.args[0], " ".join(a.args[1:]))
+        print(f"Set {a.args[0].upper()}. It takes effect next time FRIDAY starts.")
+    elif a.action == "unset":
+        for k in a.args:
+            set_env(k, None)
+        print("Removed " + ", ".join(k.upper() for k in a.args) + ".")
+    else:
+        rows = [ln.split("=", 1) for ln in env_lines() if "=" in ln and not ln.lstrip().startswith("#")]
+        if not rows:
+            print(f"  No settings yet ({ENV}). Try: friday setup")
+        for k, v in rows:
+            shown = (v[:4] + "…" if len(v) > 8 else "…") if any(w in k for w in SECRET) and v else v
+            print(f"  {k}={shown}")
+        if saved().get("url"):
+            print(f"{DIM}This device uses the FRIDAY at {saved()['url']}; its settings live there.{OFF}")
+
+
+def cmd_setup(a):
+    import getpass
+    import shutil
+    print(f"{BOLD}Let's set FRIDAY up.{OFF} Everything stays on this machine, in {HOME}.\n")
+    name = input("What should FRIDAY call you? ").strip()
+    if name:
+        set_env("FRIDAY_OWNER_NAME", name)
+    print("\nWhich brain?\n  1) Claude, with an API key (console.anthropic.com)\n"
+          "  2) Any OpenAI-compatible API: OpenRouter, Ollama, LM Studio, llama.cpp, OpenAI…")
+    if shutil.which("ant"):
+        print("  3) Claude, signing in with `ant auth login`")
+    choice = input("Pick one [1]: ").strip() or "1"
+    if choice == "2":
+        url = input("Base URL [http://localhost:11434/v1]: ").strip() or "http://localhost:11434/v1"
+        key = getpass.getpass("API key (Enter if none): ").strip()
+        model = ""
+        while not model:
+            model = input("Model name (e.g. llama3.3, anthropic/claude-opus-5.5): ").strip()
+        set_env("FRIDAY_LLM_URL", url), set_env("FRIDAY_LLM_KEY", key or None), set_env("FRIDAY_MODEL", model)
+    else:
+        set_env("FRIDAY_LLM_URL", None), set_env("FRIDAY_LLM_KEY", None)
+        if choice == "3" and shutil.which("ant"):
+            import subprocess
+            subprocess.run(["ant", "auth", "login"], check=False)
+        else:
+            key = getpass.getpass("Anthropic API key: ").strip()
+            if key:
+                set_env("ANTHROPIC_API_KEY", key)
+    print()
+    cmd_doctor(client(), a)
+    print(f"\n{BOLD}All set.{OFF} Put your headphones on and run: {CYAN}friday{OFF}")
+
+
+def cmd_doctor(c, a):
+    ok, bad = f"{CYAN}✓{OFF}", f"{YELLOW}✗{OFF}"
+    try:
+        sd = sound()
+        mic = sd.query_devices(None, "input")["name"] if not isinstance(sd, SystemSound) else sd.query_devices()["name"]
+        print(f"  {ok} Mic: {mic}")
+    except Exception as e:
+        print(f"  {bad} Mic: {e}")
+    d = call(c, "GET", "/api/doctor")
+    print(f"  {ok if d['brain'] == 'ok' else bad} Brain: {d['model']} via {d['via']}"
+          + ("" if d["brain"] == "ok" else f": {d['brain']}"))
+    print(f"  {ok if d['speech'] else bad} Ears and voice" + ("" if d["speech"] else ": models missing (run friday)"))
+    print(f"  {ok} Plugins: {', '.join(d['plugins']) or 'none'}")
+    for err in d["plugin_errors"]:
+        print(f"  {bad} {err}")
+    print(f"  {ok} {'Shared hub: ' + str(c.base_url) if saved().get('url') else 'Running on this device'}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="friday", description="FRIDAY from any device. Run with no command to talk.")
     p.add_argument("--mic", type=int, help="input device number (see friday devices); default: system default")
@@ -405,6 +652,23 @@ def main(argv=None):
     sv = sub.add_parser("serve", help="run the always-on FRIDAY your other devices log in to")
     sv.add_argument("--host", default="0.0.0.0")
     sv.add_argument("--port", type=int, default=8080)
+    ex = sub.add_parser("export", help="save everything FRIDAY knows to a JSON file you own")
+    ex.add_argument("path", nargs="?", help="file (default friday-export-DATE.json; - for stdout)")
+    ex.add_argument("--transcripts", action="store_true", help="also include kept raw speech")
+    ex.set_defaults(fn=cmd_export)
+    im = sub.add_parser("import", help="merge a FRIDAY export, or learn from any notes/text file")
+    im.add_argument("path")
+    im.set_defaults(fn=cmd_import)
+    gr = sub.add_parser("graph", help="the map of your world FRIDAY builds")
+    gr.add_argument("entity", nargs="*", help="look around one thing (default: strongest links)")
+    gr.add_argument("--depth", type=int, default=1)
+    gr.add_argument("--format", choices=("text", "mermaid", "dot", "json"), default="text")
+    gr.set_defaults(fn=cmd_graph)
+    cf = sub.add_parser("config", help="show or change settings: config | config set NAME VALUE | config unset NAME")
+    cf.add_argument("action", nargs="?", choices=("show", "set", "unset"), default="show")
+    cf.add_argument("args", nargs="*")
+    sub.add_parser("setup", help="first-run setup: your name and FRIDAY's brain")
+    sub.add_parser("doctor", help="check mic, brain, ears, voice and plugins").set_defaults(fn=cmd_doctor)
     for name, fn, arg, about in [
             ("listen", cmd_listen, None, "talk to FRIDAY (the default)"),
             ("ask", cmd_ask, "text", "one question, one answer"),
@@ -420,8 +684,9 @@ def main(argv=None):
             sp.add_argument(arg, nargs="+" if arg == "text" else "*")
         sp.set_defaults(fn=fn)
     a = p.parse_args(argv)
-    if a.cmd in ("login", "logout", "serve"):
-        return {"login": cmd_login, "logout": cmd_logout, "serve": cmd_serve}[a.cmd](a)
+    if a.cmd in ("login", "logout", "serve", "config", "setup"):
+        return {"login": cmd_login, "logout": cmd_logout, "serve": cmd_serve, "config": cmd_config,
+                "setup": cmd_setup}[a.cmd](a)
     fn = getattr(a, "fn", None) or cmd_listen
     fn(client(background=fn in (cmd_listen, cmd_watch)), a)
 

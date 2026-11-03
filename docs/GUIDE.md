@@ -64,7 +64,7 @@ from outside your home network; never expose port 8080 to the internet.
 
 | Hardware for a hub | Notes |
 |---|---|
-| Raspberry Pi 5 (8 GB), mini PC, or home server | Whisper `base.en` is comfortable on a Pi 5; set `FRIDAY_WHISPER_MODEL=tiny.en` if it lags |
+| Raspberry Pi 5 (8 GB), mini PC, or home server | SenseVoice hears a sentence in well under a second even on a Pi 5 |
 | *Optional:* room radars (below) | Tells FRIDAY when you have company at home |
 | *Optional:* Hermes Agent | Heavy research and coding |
 

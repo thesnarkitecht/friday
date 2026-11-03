@@ -1,6 +1,9 @@
-"""Claude, through the official Anthropic SDK.
+"""FRIDAY's brain: Claude through the official Anthropic SDK (default), or any OpenAI-compatible API.
 
 Sign-in: run `ant auth login` once (the SDK reads that profile), or set ANTHROPIC_API_KEY."""
+import json
+import re
+
 import anthropic
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -68,3 +71,118 @@ class Claude:
             output_format=schema, output_config={"effort": effort},
             betas=[FALLBACK_BETA], fallbacks="default"))
         return None if r.stop_reason == "refusal" else r.parsed_output
+
+
+class OpenAICompat:
+    """Any OpenAI-compatible chat API: OpenRouter, Ollama, LM Studio, llama.cpp, vLLM, OpenAI, Hermes…
+    Speaks the same interface as Claude above, so the brain doesn't care which one it's talking to."""
+
+    def __init__(self, base_url, key, model, http=None):
+        import httpx
+        self.url, self.model = base_url.rstrip("/") + "/chat/completions", model
+        self.http = http or httpx.AsyncClient(timeout=300)
+        self.headers = {"Authorization": f"Bearer {key}"} if key else {}
+
+    async def _post(self, body):
+        import httpx
+        try:
+            r = await self.http.send(self.http.build_request("POST", self.url, json=body, headers=self.headers),
+                                     stream=bool(body.get("stream")))
+        except httpx.HTTPError as e:
+            raise Unavailable(f"I can't reach the model at {self.url.split('/')[2]}.") from e
+        if r.status_code in (401, 403):
+            await r.aclose()
+            raise Unavailable("The model service refused the key. Check FRIDAY_LLM_KEY.")
+        if r.status_code == 429:
+            await r.aclose()
+            raise Unavailable("The model service is rate-limiting me. Try me again in a minute.")
+        return r
+
+    async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000, on_text=None):
+        body = {"model": self.model, "max_tokens": max_tokens, "stream": bool(on_text),
+                "messages": [{"role": "system", "content": system}, *to_openai(messages)]}
+        if tools:
+            body["tools"] = [{"type": "function", "function": {
+                "name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in tools]
+        r = await self._post(body)
+        text, calls, finish = "", {}, None
+        if on_text:
+            async for line in r.aiter_lines():
+                if not line.startswith("data:") or line.strip() == "data: [DONE]":
+                    continue
+                choice = (json.loads(line[5:]).get("choices") or [{}])[0]
+                finish = choice.get("finish_reason") or finish
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    text += delta["content"]
+                    await on_text(delta["content"])
+                for tc in delta.get("tool_calls") or []:  # tool calls arrive in pieces, keyed by index
+                    c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+                    c["id"] = tc.get("id") or c["id"]
+                    c["name"] += (tc.get("function") or {}).get("name") or ""
+                    c["args"] += (tc.get("function") or {}).get("arguments") or ""
+        else:
+            await r.aread()
+            if r.status_code >= 400:
+                raise Unavailable("The model service had a problem with that request.")
+            choice = r.json()["choices"][0]
+            finish, msg = choice.get("finish_reason"), choice["message"]
+            text = msg.get("content") or ""
+            for i, tc in enumerate(msg.get("tool_calls") or []):
+                calls[i] = {"id": tc["id"], "name": tc["function"]["name"], "args": tc["function"]["arguments"]}
+        uses = [{"id": c["id"] or f"call_{i}", "name": c["name"], "input": _args(c["args"])}
+                for i, c in sorted(calls.items())]
+        content = ([{"type": "text", "text": text}] if text else []) + [{"type": "tool_use", **u} for u in uses]
+        stop = "refusal" if finish == "content_filter" else "tool_use" if uses else "end_turn"
+        return {"stop": stop, "content": content, "text": text.strip(), "tool_uses": uses}
+
+    async def decide(self, prompt, schema, effort="low", max_tokens=4000):
+        """Structured output where the server supports it; otherwise ask for JSON and validate it."""
+        import pydantic
+        fmt = {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()}}
+        body = {"model": self.model, "max_tokens": max_tokens, "response_format": fmt,
+                "messages": [{"role": "user", "content": prompt}]}
+        r = await self._post(body)
+        await r.aread()
+        if r.status_code == 400:  # no structured outputs here: describe the shape instead
+            body.pop("response_format")
+            body["messages"][0]["content"] += ("\n\nReply with only a JSON object matching this JSON Schema:\n"
+                                               + json.dumps(schema.model_json_schema()))
+            r = await self._post(body)
+            await r.aread()
+        if r.status_code >= 400:
+            raise Unavailable("The model service had a problem with that request.")
+        raw = r.json()["choices"][0]["message"].get("content") or ""
+        m = re.search(r"\{.*\}", raw, re.S)
+        try:
+            return schema.model_validate_json(m.group(0)) if m else None
+        except pydantic.ValidationError:
+            return None
+
+
+def _args(raw):
+    try:
+        v = json.loads(raw or "{}")
+        return v if isinstance(v, dict) else {}
+    except json.JSONDecodeError:
+        return {}  # the tool reports what's missing; the model can try again
+
+
+def to_openai(messages):
+    """The brain's Anthropic-shaped history -> OpenAI chat messages."""
+    out = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": m["role"], "content": content})
+        elif m["role"] == "user":  # tool results
+            out += [{"role": "tool", "tool_call_id": b["tool_use_id"], "content": b["content"]}
+                    for b in content if b.get("type") == "tool_result"]
+        else:
+            blocks = [b if isinstance(b, dict) else b.model_dump() for b in content]
+            msg = {"role": "assistant", "content": "".join(b.get("text", "") for b in blocks if b["type"] == "text")}
+            calls = [{"id": b["id"], "type": "function",
+                      "function": {"name": b["name"], "arguments": json.dumps(b["input"])}}
+                     for b in blocks if b["type"] == "tool_use"]
+            out.append({**msg, **({"tool_calls": calls} if calls else {})})
+    return out

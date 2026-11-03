@@ -32,7 +32,12 @@ def load():
         plugin_roots=[str(PACKAGE / "builtin_plugins"), e("FRIDAY_PLUGINS_DIR") or str(home / "plugins")],
         voice=voice,
         voice_path=e("FRIDAY_PIPER_VOICE") or str(home / "voices" / f"{voice}.onnx"),
-        model=e("FRIDAY_MODEL", "claude-opus-5-5"),
+        models_dir=e("FRIDAY_MODELS_DIR") or str(home / "models"),  # speech recognition model
+        # Any OpenAI-compatible API instead of Claude: set its base URL (e.g. http://localhost:11434/v1 for
+        # Ollama, https://openrouter.ai/api/v1), key, and FRIDAY_MODEL.
+        llm_url=e("FRIDAY_LLM_URL", ""),
+        llm_key=e("FRIDAY_LLM_KEY", ""),
+        model=e("FRIDAY_MODEL") or ("" if e("FRIDAY_LLM_URL") else "claude-opus-5-5"),
         # Raw speech is dropped after the nightly pass unless it scored as worth keeping.
         retain_days=int(e("FRIDAY_RETAIN_DAYS", "1")),
         keep_importance=float(e("FRIDAY_KEEP_IMPORTANCE", "0.5")),

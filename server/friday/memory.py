@@ -23,6 +23,10 @@ create table if not exists notifications(id integer primary key, ts real, kind t
 create table if not exists taste(kind text primary key, score real);
 create table if not exists routines(id integer primary key, at text, days text, task text, last_day text);
 create table if not exists questions(id integer primary key, text text unique, asked real, answer text);
+create table if not exists entities(name text primary key collate nocase, kind text, mentions int default 1,
+    last real);
+create table if not exists links(src text collate nocase, rel text, dst text collate nocase, weight int default 1,
+    last real, primary key(src, rel, dst));
 create table if not exists held(id integer primary key, ts real, kind text, text text);
 """
 
@@ -59,7 +63,10 @@ CONSOLIDATE = (
     "friend would ask about afterwards, phrased as that question, due a little after the event (kind "
     "'checkin', e.g. 'How did the interview go?'). Due times are ISO-8601 local. Finally, if you notice one "
     "pattern worth mentioning (something they keep asking about, a recurring frustration, a habit), write "
-    "it as one short, friendly offer of help; otherwise leave it empty.\n\n")
+    "it as one short, friendly offer of help; otherwise leave it empty. Also map the owner's world as links "
+    "(subject, relation, object): projects, tools, topics, places, organizations, and people only in how "
+    "they relate to the owner's work and interests. Use 'me' for the owner. Never link health, money, "
+    "family or relationship details.\n\n")
 
 
 class Fact(BaseModel):
@@ -74,11 +81,20 @@ class Reminder(BaseModel):
     kind: str = "reminder"  # reminder | checkin
 
 
+class Link(BaseModel):
+    subject: str
+    relation: str  # short verb phrase: "works on", "uses", "lives in", "is interested in"
+    object: str
+    subject_kind: str = "other"  # person | project | tool | topic | place | org | other
+    object_kind: str = "other"
+
+
 class Digest(BaseModel):
     summary: str
     facts: list[Fact]
     reminders: list[Reminder]
     observation: str = ""
+    links: list[Link] = []
 
 
 QUESTIONS = (
@@ -90,6 +106,13 @@ QUESTIONS = (
 
 class Questions(BaseModel):
     questions: list[str]
+
+
+def _num(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _chunks(lines, size):
@@ -337,26 +360,11 @@ class Memory:
         day = datetime.fromtimestamp(rows[0]["ts"]).strftime("%Y-%m-%d")
         lines = [f"{datetime.fromtimestamp(r['ts']):%H:%M} [{r['speaker']}|imp {r['importance']}] {r['text']}"
                  for r in rows]
-        data = {"summary": "", "facts": [], "reminders": [], "observations": []}
-        for chunk in _chunks(lines, chunk_chars):  # small context windows: digest the day in bites
-            part = await llm.decide(CONSOLIDATE + chunk, Digest, effort="medium")
-            if part:
-                data["summary"] = " ".join(x for x in (data["summary"], part.summary) if x)
-                data["facts"] += [f.model_dump() for f in part.facts]
-                data["reminders"] += [r.model_dump() for r in part.reminders]
-                data["observations"] += [part.observation.strip()] if part.observation.strip() else []
+        data = await self.digest(llm, lines, chunk_chars)
         if data["summary"]:
             self.db.execute("insert or replace into episodes values(?, coalesce((select summary from episodes "
                             "where day = ?) || ' ', '') || ?)", (day, day, data["summary"]))
-        for f in data["facts"]:
-            if f.get("text"):
-                self.remember(f["text"], f.get("category", "other"), float(f.get("importance", 0.6)), "consolidated")
-        for r in data["reminders"]:
-            try:
-                kind = r.get("kind") if r.get("kind") in ("reminder", "checkin") else "reminder"
-                self.add_reminder(r["text"], datetime.fromisoformat(r["due"]).timestamp(), kind)
-            except (KeyError, ValueError, TypeError):
-                pass
+        self._keep(data, "consolidated")
         if data["observations"]:
             self.hold("insight", data["observations"][0])  # one pattern a day, at the next good moment
         ids = [(r["id"],) for r in rows]
@@ -364,6 +372,137 @@ class Memory:
         self._purge(now)
         self.db.commit()
         return data
+
+    async def digest(self, llm, lines, chunk_chars=6000):
+        """Turn lines of text into facts, reminders, links and a summary, a context-window-sized bite at a time."""
+        data = {"summary": "", "facts": [], "reminders": [], "observations": [], "links": []}
+        for chunk in _chunks(lines, chunk_chars):
+            part = await llm.decide(CONSOLIDATE + chunk, Digest, effort="medium")
+            if part:
+                data["summary"] = " ".join(x for x in (data["summary"], part.summary) if x)
+                data["facts"] += [f.model_dump() for f in part.facts]
+                data["reminders"] += [r.model_dump() for r in part.reminders]
+                data["observations"] += [part.observation.strip()] if part.observation.strip() else []
+                data["links"] += [x.model_dump() for x in part.links]
+        return data
+
+    def _keep(self, data, source):
+        for f in data["facts"]:
+            if f.get("text"):
+                self.remember(f["text"], f.get("category", "other"), float(f.get("importance", 0.6)), source)
+        for r in data["reminders"]:
+            try:
+                kind = r.get("kind") if r.get("kind") in ("reminder", "checkin") else "reminder"
+                self.add_reminder(r["text"], datetime.fromisoformat(r["due"]).timestamp(), kind)
+            except (KeyError, ValueError, TypeError):
+                pass
+        for x in data["links"]:
+            self.link(x["subject"], x["relation"], x["object"], x.get("subject_kind"), x.get("object_kind"))
+
+    async def learn_document(self, llm, text):
+        """`friday import notes.md`: learn facts, reminders and links from any text (no day summary)."""
+        data = await self.digest(llm, [line for line in text.splitlines() if line.strip()])
+        self._keep(data, "imported")
+        self.db.commit()
+        return {k: len(data[k]) for k in ("facts", "reminders", "links")}
+
+    # --- the graph: how the things in the owner's world connect -------------------------------
+    def link(self, subject, relation, obj, subject_kind=None, object_kind=None, now=None):
+        subject, relation, obj = (" ".join(str(x).split())[:80] for x in (subject, relation, obj))
+        if not (subject and relation and obj) or subject.lower() == obj.lower():
+            return
+        now = now or time.time()
+        for name, kind in ((subject, subject_kind), (obj, object_kind)):
+            self.db.execute("insert into entities(name, kind, last) values(?, ?, ?) on conflict(name) do update set "
+                            "mentions = mentions + 1, last = excluded.last, kind = coalesce(nullif(excluded.kind, "
+                            "'other'), kind)", (name, kind or "other", now))
+        self.db.execute("insert into links values(?, ?, ?, 1, ?) on conflict(src, rel, dst) do update set "
+                        "weight = weight + 1, last = excluded.last", (subject, relation.lower(), obj, now))
+        self.db.commit()
+
+    def graph(self, entity=None, depth=1, limit=60):
+        """The whole map (strongest links first) or the neighborhood of one entity."""
+        if entity:
+            names, edges = {entity.lower()}, {}
+            for _ in range(depth):
+                marks = ",".join("?" * len(names))
+                for r in self.db.execute(f"select * from links where lower(src) in ({marks}) or lower(dst) in ({marks}) "
+                                         "order by weight desc limit ?", (*names, *names, limit)):
+                    edges[(r["src"], r["rel"], r["dst"])] = r["weight"]
+                names |= {n.lower() for e in edges for n in (e[0], e[2])}
+        else:
+            edges = {(r["src"], r["rel"], r["dst"]): r["weight"] for r in
+                     self.db.execute("select * from links order by weight desc, last desc limit ?", (limit,))}
+        names = {n for e in edges for n in (e[0], e[2])}
+        kinds = {r["name"].lower(): r["kind"] for r in self.db.execute("select name, kind from entities")}
+        return {"nodes": [{"name": n, "kind": kinds.get(n.lower(), "other")} for n in sorted(names)],
+                "edges": [{"from": a, "rel": r, "to": b, "weight": w} for (a, r, b), w in edges.items()]}
+
+    # --- import / export ---------------------------------------------------------------------
+    def export(self, skills, transcripts=False):
+        rows = lambda q: [dict(r) for r in self.db.execute(q)]  # noqa: E731
+        out = {"friday_export": 1, "exported": datetime.now().astimezone().isoformat(),
+               "facts": rows("select ts, category, text, importance, source from facts"),
+               "episodes": rows("select day, summary from episodes"),
+               "reminders": rows("select due, text, kind, done from reminders"),
+               "routines": rows("select at, days, task from routines"),
+               "questions": rows("select text, asked, answer from questions"),
+               "taste": self.tastes(), "entities": rows("select name, kind, mentions, last from entities"),
+               "links": rows("select src, rel, dst, weight, last from links"),
+               "skills": {n: (v["dir"] / "SKILL.md").read_text(encoding="utf-8") for n, v in skills.all().items()
+                          if v["dir"].parent == skills.root}}
+        if transcripts:
+            out["utterances"] = rows("select ts, speaker, text, importance, addressed from utterances")
+        return out
+
+    def import_(self, data, skills):
+        """Merge a FRIDAY export into this memory. Nothing already here is overwritten except skills of the
+        same name. Returns counts. Every field is checked: this file may come from anywhere."""
+        if not isinstance(data, dict) or data.get("friday_export") != 1:
+            raise ValueError("not a FRIDAY export (expected friday_export: 1)")
+        n = dict.fromkeys(("facts", "episodes", "reminders", "routines", "questions", "links", "skills"), 0)
+        s = lambda v, cap=2000: str(v)[:cap] if v is not None else ""  # noqa: E731
+        for f in data.get("facts") or []:
+            if isinstance(f, dict) and s(f.get("text")).strip():
+                self.remember(s(f["text"]), s(f.get("category") or "other", 40),
+                              _num(f.get("importance"), 0.6), s(f.get("source") or "imported", 40))
+                n["facts"] += 1
+        for e in data.get("episodes") or []:
+            if isinstance(e, dict) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s(e.get("day"))):
+                self.db.execute("insert or ignore into episodes values(?, ?)", (e["day"], s(e.get("summary"), 5000)))
+                n["episodes"] += 1
+        for r in data.get("reminders") or []:
+            if isinstance(r, dict) and not r.get("done") and s(r.get("text")):
+                self.add_reminder(s(r["text"]), _num(r.get("due"), time.time()),
+                                  r.get("kind") if r.get("kind") in ("reminder", "checkin") else "reminder")
+                n["reminders"] += 1
+        for r in data.get("routines") or []:
+            try:
+                self.add_routine(s(r["at"], 5), s(r["days"], 40), s(r["task"], 500))
+                n["routines"] += 1
+            except (KeyError, TypeError, ValueError):
+                pass
+        for q in data.get("questions") or []:
+            if isinstance(q, dict) and s(q.get("text")):
+                self.add_questions([s(q["text"], 300)])
+                n["questions"] += 1
+        for kind, score in (data.get("taste") or {}).items():
+            if s(kind, 40) not in self.tastes():
+                self.db.execute("insert or replace into taste values(?, ?)", (s(kind, 40), min(1, max(0, _num(score, .6)))))
+        for x in data.get("links") or []:
+            if isinstance(x, dict):
+                self.link(s(x.get("src"), 80), s(x.get("rel"), 80), s(x.get("dst"), 80), now=_num(x.get("last"), None))
+                n["links"] += 1
+        for name, text in (data.get("skills") or {}).items():
+            try:
+                meta = re.search(r"^description:\s*(.+)$", s(text, 20000), re.M)
+                body = s(text, 20000).split("---", 2)[-1]
+                skills.save(s(name, 40), meta.group(1) if meta else "", body)
+                n["skills"] += 1
+            except (ValueError, AttributeError):
+                pass
+        self.db.commit()
+        return n
 
     def _purge(self, now):
         cutoff = now - self.retain_days * 86400
