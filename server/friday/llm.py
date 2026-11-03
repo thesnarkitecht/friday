@@ -19,12 +19,22 @@ async def _call(make):
         raise Unavailable("Claude is rate-limiting me. Try me again in a minute.") from e
     except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
         raise Unavailable("I can't reach Claude right now.") from e
+    except (TypeError, anthropic.CredentialsError) as e:  # no sign-in profile and no key
+        if isinstance(e, TypeError) and "authentication" not in str(e):
+            raise
+        raise Unavailable("I'm not signed in to Claude yet. Run ant auth login, or set ANTHROPIC_API_KEY.") from e
 
 
 class Claude:
     def __init__(self, model="claude-opus-5-5", client=None):
-        self.model = model
-        self.client = client or anthropic.AsyncAnthropic()
+        self.model, self._client = model, client
+
+    @property
+    def client(self):
+        # Created on first use, so a missing sign-in is a spoken answer, not a server that won't start.
+        if self._client is None:
+            self._client = anthropic.AsyncAnthropic()
+        return self._client
 
     async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000):
         """One Messages API call. Returns text, tool uses, and the raw content to append back unchanged."""

@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-voice.txt
 # Piper voice baked in so the container needs no download at runtime.
 RUN mkdir -p /opt/voices && python -m piper.download_voices --data-dir /opt/voices en_US-lessac-medium
 COPY friday ./friday
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --no-deps . && rm -rf build  # the `friday` CLI inside the container
 COPY plugins ./plugins
 COPY skills ./skills.seed
 COPY start.sh ./

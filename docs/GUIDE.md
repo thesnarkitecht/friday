@@ -73,12 +73,51 @@ curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json
 `GET /api/hud` shows loaded plugins (and any that failed), the situation FRIDAY sees, learned
 interruption scores, and recent speech.
 
+## Driving it
+
+### From a terminal
+
+Inside the container:
+
+```bash
+docker compose exec friday friday chat
+```
+
+From another machine (needs Python 3.10+):
+
+```bash
+pip install ./server
+```
+
+```bash
+export FRIDAY_URL=http://<box>:8080 FRIDAY_TOKEN=...
+```
+
+| Command | What it does |
+|---|---|
+| `friday ask "…"` | One question, one answer (plus a catch-up line if things were held for you) |
+| `friday chat` | Back-and-forth until Ctrl-D |
+| `friday heard "…"` | As if overheard; FRIDAY decides whether it was meant for it |
+| `friday watch` | Live: what FRIDAY hears, says, and alerts |
+| `friday status` | Plugins, situation, what it learned about interrupting you, skills, routines, recent alerts |
+| `friday memory [query]` | What it knows about you, or a search |
+| `friday forget "…"` | Delete facts containing that text |
+
+Typed and spoken conversations are the same conversation: what you type counts as you talking to FRIDAY.
+
+### From OpenAI-compatible clients
+
+Base URL `http://<box>:8080/v1`, API key = `FRIDAY_TOKEN`, model `friday`. `/v1/models` and
+`/v1/chat/completions` (with or without streaming) are supported. FRIDAY keeps its own memory and
+history, so it only reads the latest user message; the client's system prompt and earlier turns are ignored.
+
 ## How FRIDAY decides to speak
 
 - **Always, right away:** reminders you set, routines you scheduled, Hermes reporting back.
 - **Everything else** (new models, Hacker News, any plugin feed) goes through two checks:
-  1. **Company.** If room radars count more than one person, or another voice was heard in the last
-     2 minutes, it waits. When company leaves, you get one line: "Catching you up: …".
+  1. **Company and quiet hours.** If room radars count more than one person, another voice was heard in
+     the last 2 minutes, or it's quiet hours (`FRIDAY_QUIET_HOURS`, 22–8 by default), it waits. When
+     company leaves or you next talk to FRIDAY, you get one line: "Catching you up: …".
   2. **What it has learned.** Push back within 90 seconds ("not now", "I know", "stop") and that kind
      of alert scores lower; engage and it scores higher. Below 0.4 it stops interrupting and waits for
      the next good moment: the next time you talk to FRIDAY, or company leaving.
@@ -152,9 +191,11 @@ sensor:
 |---|---|
 | `WS /ws?token=…` | Send `{"type":"utterance","text":…}` or `{"type":"presence","room":…,"people":…}`. Receive `heard`, `say`, `notify`, `memory` |
 | `POST /api/utterance` | Everything heard; FRIDAY decides whether it was addressed |
-| `POST /api/ask` | Push-to-talk: always addressed |
+| `POST /api/ask` | CLI / push-to-talk: always addressed. Returns `reply` and `catch_up` |
+| `POST /api/forget` | Delete facts containing `text` |
+| `GET /v1/models`, `POST /v1/chat/completions` | OpenAI-compatible |
 | `POST /api/presence` | Room radars |
-| `GET /api/hud` | Plugins, situation, learned scores, recent speech |
+| `GET /api/hud` | Plugins, situation, learned scores, skills, routines, recent speech |
 | `GET /api/memory?q=` | What FRIDAY knows about you |
 
 Keep port 8080 on your LAN or Tailscale. It holds your life.

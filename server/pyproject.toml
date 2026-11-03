@@ -1,0 +1,17 @@
+# `pip install ./server` puts the `friday` command on any machine (the CLI only needs httpx + websockets).
+# The server's own dependencies are in requirements.txt / requirements-voice.txt.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "friday-assistant"
+version = "0.2.0"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27", "websockets>=12"]
+
+[project.scripts]
+friday = "friday.cli:main"
+
+[tool.setuptools]
+packages = ["friday"]

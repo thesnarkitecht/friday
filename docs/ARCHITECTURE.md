@@ -31,7 +31,7 @@ flowchart TB
             due["Reminders · routines"]
             feeds["Plugin feeds, plain HTTP, zero tokens<br/>new models (OpenRouter) · Hacker News"]
             ask["One preference question a day<br/>at a quiet moment"]
-            gate{"Speak now?<br/>urgent → yes<br/>company → hold<br/>learned score below 0.4 → hold"}
+            gate{"Speak now?<br/>urgent → yes<br/>company or quiet hours → hold<br/>learned score below 0.4 → hold"}
             held[("Held for a good moment")]
         end
 
@@ -43,9 +43,11 @@ flowchart TB
     end
 
     hermes(["Hermes Agent<br/>OpenAI-compatible API<br/>research + coding"])
+    clients["friday CLI · OpenAI clients<br/>/api/ask · /v1/chat/completions"]
     you(("Your reaction<br/>within 90 s"))
 
     buds --> vad --> stt --> hear
+    clients -- "typed = you talking" --> ctx
     hear --> mem
     hear --> who
     who -- yes --> ctx

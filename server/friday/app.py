@@ -1,14 +1,18 @@
 """FRIDAY server. Run: uvicorn friday.app:app --host 0.0.0.0 --port 8080"""
 import asyncio
 import hmac
+import json
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 
 from . import config, plugins, proactive, tools
 from .addressee import Addressee
@@ -60,7 +64,7 @@ def create_app(settings=None, llm=None, background=True, http=None):
         the owner has company, and wait for good if the learning loop says they don't want them live."""
         if urgent or kind in URGENT:
             await say(kind, text)
-        elif busy() or state.memory.taste(kind) < INTERRUPT:
+        elif busy() or quiet_hours() or state.memory.taste(kind) < INTERRUPT:
             state.memory.hold(kind, text)
         else:
             await say(kind, text, about=[kind])
@@ -69,8 +73,15 @@ def create_app(settings=None, llm=None, background=True, http=None):
         """Deliver what was held, as one short line, at a good moment."""
         held = state.memory.release()
         if held:
-            await say("briefing", "Catching you up: " + " ".join(t.rstrip(".") + "." for _, t in held),
-                      about=[k for k, _ in held])
+            text = "Catching you up: " + " ".join(t.rstrip(".") + "." for _, t in held)
+            await say("briefing", text, about=[k for k, _ in held])
+            return text
+
+    def quiet_hours(now=None):
+        """Non-urgent things wait overnight; they're delivered the next time you talk to FRIDAY."""
+        start, end = s.quiet_hours
+        h = datetime.fromtimestamp(now or time.time()).hour
+        return start != end and (start <= h < end if start < end else h >= start or h < end)
 
     def busy():
         """With company: room sensors count others, or another voice was heard lately (works anywhere)."""
@@ -110,7 +121,7 @@ def create_app(settings=None, llm=None, background=True, http=None):
 
     state.last_said, state.presence, state.other_voice = None, {}, 0.0  # presence: room -> people the sensors count
     state.pending_question, state.last_owner = None, 0.0
-    state.notify, state.ask_question = notify, ask_question
+    state.notify, state.ask_question, state.quiet_hours = notify, ask_question, quiet_hours
     registry = tools.build(state)
     state.plugins, state.plugin_errors = plugins.load(s.plugins_dir, state, registry)
     state.brain = Brain(state.llm, state.memory, registry, s.owner, skills=state.skills)
@@ -134,6 +145,11 @@ def create_app(settings=None, llm=None, background=True, http=None):
         await broadcast({"type": "heard", "text": text, "addressed": addressed})
         if not addressed:
             return None
+        return (await converse(cleaned))[0]
+
+    async def converse(cleaned):
+        """The owner said something to FRIDAY (by voice, CLI or an OpenAI client). Returns the reply and
+        any catch-up line delivered with it."""
         state.last_owner = time.time()
         learn_from(cleaned)
         if state.pending_question and time.time() - state.pending_question[1] < ANSWER_S:
@@ -144,9 +160,8 @@ def create_app(settings=None, llm=None, background=True, http=None):
         state.addressee.spoke()
         await broadcast({"type": "say", "text": reply})
         await broadcast({"type": "memory", "facts": state.memory.profile()})
-        if not busy():
-            await brief()  # the owner is engaged anyway: a good moment for what was held
-        return reply
+        catch_up = None if busy() else await brief()  # the owner is engaged anyway: a good moment
+        return reply, catch_up
 
     def auth(request: Request):
         given = request.headers.get("authorization", "").removeprefix("Bearer ")
@@ -209,18 +224,56 @@ def create_app(settings=None, llm=None, background=True, http=None):
 
     @app.post("/api/ask", dependencies=[Depends(auth)])
     async def ask(body: dict):
-        """Push-to-talk / scripts entry point: always addressed, always the owner."""
-        state.memory.add_utterance(body["text"], speaker="owner", addressed=True)
-        state.last_owner = time.time()
-        reply = await state.brain.respond(body["text"], situation=situation())
-        state.memory.add_utterance(reply, speaker="friday", addressed=True)
-        return {"reply": reply}
+        """CLI / push-to-talk / scripts: always addressed, always the owner."""
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise HTTPException(400, 'Send {"text": "..."}')
+        state.memory.add_utterance(text, speaker="owner", addressed=True)
+        reply, catch_up = await converse(text)
+        return {"reply": reply, "catch_up": catch_up}
+
+    @app.get("/v1/models", dependencies=[Depends(auth)])
+    async def models():
+        return {"object": "list", "data": [{"id": "friday", "object": "model", "created": 0, "owned_by": "friday"}]}
+
+    @app.post("/v1/chat/completions", dependencies=[Depends(auth)])
+    async def chat_completions(body: dict):
+        """OpenAI-compatible: any OpenAI client can talk to FRIDAY. FRIDAY keeps its own memory and
+        history, so only the latest user message is used; the client's system prompt is ignored."""
+        last = next((m for m in reversed(body.get("messages") or []) if m.get("role") == "user"), None)
+        content = (last or {}).get("content")
+        if isinstance(content, list):  # [{"type": "text", "text": ...}, ...]
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if not isinstance(content, str) or not content.strip():
+            raise HTTPException(400, "Send at least one user message with text.")
+        result = await ask({"text": content})
+        text = "\n\n".join(x for x in (result["reply"], result["catch_up"]) if x)
+        cid, now = f"chatcmpl-{secrets.token_hex(8)}", int(time.time())
+        if body.get("stream"):
+            def chunk(delta, finish=None):
+                return "data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "created": now,
+                                              "model": "friday", "choices": [
+                                                  {"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+            events = [chunk({"role": "assistant", "content": text}), chunk({}, "stop"), "data: [DONE]\n\n"]
+            return StreamingResponse(iter(events), media_type="text/event-stream")
+        return {"id": cid, "object": "chat.completion", "created": now, "model": "friday",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+    @app.post("/api/forget", dependencies=[Depends(auth)])
+    async def forget(body: dict):
+        try:
+            return {"forgot": state.memory.forget(str(body.get("text", "")))}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
 
     @app.get("/api/hud", dependencies=[Depends(auth)])
     async def hud():
         return {"presence": state.presence, "situation": situation(), "plugins": [p.name for p in state.plugins],
                 "plugin_errors": state.plugin_errors,
                 "learned": state.memory.tastes(), "notifications": state.memory.notifications(),
+                "skills": {n: v["description"] for n, v in state.skills.all().items()},
+                "routines": state.memory.routines(),
                 "recent": state.memory.recent(20)}
 
     @app.get("/api/memory", dependencies=[Depends(auth)])

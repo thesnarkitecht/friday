@@ -38,8 +38,13 @@ credential (one `.env` file). No MCP servers.
 - **Hands heavy work to Hermes Agent.** Research and coding go to Hermes over its OpenAI-compatible
   API. FRIDAY tells you when the answer is back.
 - **Knows when to interrupt.** Reminders and things you asked for always speak. Everything else waits
-  while you have company, and learns from your reactions: say "not now" and that kind of alert starts
-  waiting for a good moment instead.
+  while you have company or during quiet hours (22:00–08:00 by default), and learns from your reactions:
+  say "not now" and that kind of alert starts waiting for a good moment instead.
+- **Drivable from a terminal.** `friday ask`, `friday chat`, `friday watch` (live view of what it hears,
+  says and holds back), `friday status`, `friday memory`, `friday forget`.
+- **Works with any OpenAI-compatible client.** Point Open WebUI, LibreChat, a script, or anything that
+  speaks the OpenAI API at `http://<box>:8080/v1`, with your `FRIDAY_TOKEN` as the API key and `friday`
+  as the model. Streaming works.
 
 ## Run it
 
@@ -49,7 +54,31 @@ ant auth login            # Claude sign-in (or set ANTHROPIC_API_KEY in .env)
 docker compose up -d --build
 ```
 
-Pair your earbuds with the host first (see [docs/GUIDE.md](docs/GUIDE.md)). Tests:
+Pair your earbuds with the host first (see [docs/GUIDE.md](docs/GUIDE.md)). Then:
+
+```bash
+docker compose exec friday friday chat
+```
+
+Or from any machine on your network:
+
+```bash
+pip install ./server
+```
+
+```bash
+FRIDAY_URL=http://<box>:8080 FRIDAY_TOKEN=... friday watch
+```
+
+From Python, or any OpenAI client:
+
+```python
+from openai import OpenAI
+friday = OpenAI(base_url="http://<box>:8080/v1", api_key="<FRIDAY_TOKEN>")
+print(friday.chat.completions.create(model="friday", messages=[{"role": "user", "content": "Anything new?"}]).choices[0].message.content)
+```
+
+Tests:
 `cd server && pip install -r requirements.txt && python -m pytest -q`
 
 ## Plugins

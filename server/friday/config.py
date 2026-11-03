@@ -16,4 +16,6 @@ def load():
         retain_days=int(e("FRIDAY_RETAIN_DAYS", "1")),
         keep_importance=float(e("FRIDAY_KEEP_IMPORTANCE", "0.5")),
         record_others=e("FRIDAY_RECORD_OTHERS", "0") == "1",
+        # Hours (local, 24h) when only urgent things speak, as "start-end". "0-0" turns it off.
+        quiet_hours=tuple(int(h) for h in e("FRIDAY_QUIET_HOURS", "22-8").split("-")),
     )

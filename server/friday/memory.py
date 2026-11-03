@@ -151,6 +151,8 @@ class Memory:
 
     def forget(self, text):
         """Delete facts containing text. Returns what was forgotten."""
+        if len(text.strip()) < 3:
+            raise ValueError("say a bit more of what to forget (3+ characters)")  # "a" would match everything
         rows = self.db.execute("select id, text from facts where text like ?", (f"%{text.strip()}%",)).fetchall()
         for r in rows:
             self.db.execute("delete from facts where id = ?", (r["id"],))

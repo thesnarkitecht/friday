@@ -48,6 +48,7 @@ def settings(tmp_path, **kw):
     s = config.load()
     s.token, s.db, s.owner = "secret", str(tmp_path / "f.db"), "Ryan"
     s.skills_dir, s.plugins_dir = str(tmp_path / "skills"), str(tmp_path / "plugins")
+    s.quiet_hours = (0, 0)  # tests run at any hour; quiet hours have their own test
     s.__dict__.update(kw)
     return s
 
@@ -103,6 +104,8 @@ def test_search_survives_fts_syntax_and_forget_works(tmp_path):
     m.remember('He said "NEAR(" AND OR *')
     assert m.search('"NEAR(" AND OR *')  # FTS operators are quoted as plain words, not parsed
     assert m.search("*") == []
+    with pytest.raises(ValueError):
+        m.forget("a")  # would match nearly everything
     assert m.forget("NEAR(") == ['He said "NEAR(" AND OR *'] and m.profile() == []
 
 
@@ -406,3 +409,67 @@ def test_claude_outage_is_spoken_not_a_crash(tmp_path):
     with TestClient(app) as c:
         r = c.post("/api/utterance", json={"text": "Friday, hello"}, headers=H).json()
     assert r == {"addressed": True, "reply": "I can't reach Claude right now."}
+
+
+# --- OpenAI-compatible API + CLI --------------------------------------------------------
+def test_openai_clients_can_talk_to_friday(tmp_path):
+    llm = FakeLLM("Nothing new from the big labs today.", "Second answer.")
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    msgs = [{"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": [{"type": "text", "text": "Did a new model drop?"}]}]
+    with TestClient(app) as c:
+        assert c.get("/v1/models").status_code == 401
+        assert c.get("/v1/models", headers=H).json()["data"][0]["id"] == "friday"
+        r = c.post("/v1/chat/completions", headers=H, json={"model": "friday", "messages": msgs}).json()
+        assert r["object"] == "chat.completion"
+        assert r["choices"][0]["message"] == {"role": "assistant", "content": "Nothing new from the big labs today."}
+        asyncio.run(app.state.friday.notify("hn", "Rust 2.0 is out"))
+        app.state.friday.memory.learn("hn", liked=False)  # pretend it's held
+        stream = c.post("/v1/chat/completions", headers=H, json={"messages": msgs, "stream": True}).text
+        events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: {")]
+        assert events[0]["choices"][0]["delta"]["content"].startswith("Second answer.")
+        assert events[-1]["choices"][0]["finish_reason"] == "stop" and stream.rstrip().endswith("data: [DONE]")
+        assert c.post("/v1/chat/completions", headers=H, json={"messages": []}).status_code == 400
+    assert llm.sent[0]["messages"][-1]["content"].endswith("Did a new model drop?")
+
+
+def test_cli_drives_friday(tmp_path, monkeypatch, capsys):
+    from friday import cli
+    app = create_app(settings(tmp_path), llm=FakeLLM("Two new models today."), background=False)
+    with TestClient(app, headers=H) as c:
+        monkeypatch.setattr(cli, "client", lambda: c)
+        cli.main(["ask", "anything", "new?"])
+        assert "Two new models today." in capsys.readouterr().out
+        app.state.friday.addressee.last_spoke = 0  # follow-up window closed
+        cli.main(["heard", "pass the salt"])
+        assert "not for FRIDAY" in capsys.readouterr().out
+        app.state.friday.memory.remember("Rust", "interest")
+        cli.main(["memory"])
+        assert "[interest] Rust" in capsys.readouterr().out
+        cli.main(["forget", "Rust"])
+        assert "forgot: Rust" in capsys.readouterr().out
+        cli.main(["status"])
+        out = capsys.readouterr().out
+        assert "Situation" in out and "Skills" in out
+        with pytest.raises(SystemExit):
+            cli.main(["forget", "a"])  # refused by the server, reported, not a traceback
+
+
+def test_quiet_hours_hold_non_urgent_things_overnight(tmp_path):
+    f = create_app(settings(tmp_path, quiet_hours=(22, 8)), llm=FakeLLM(), background=False).state.friday
+    late, morning, noon = (datetime(2030, 1, 1, h).timestamp() for h in (23, 7, 12))
+    assert f.quiet_hours(late) and f.quiet_hours(morning) and not f.quiet_hours(noon)
+    f.settings.quiet_hours = (0, 0)
+    assert not f.quiet_hours(late)
+
+
+@pytest.mark.parametrize("empty_profile_dir", [False, True])
+def test_no_claude_credentials_at_all_is_spoken(tmp_path, monkeypatch, empty_profile_dir):
+    from friday.llm import Claude, Unavailable
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # no `ant auth login` profile
+    if empty_profile_dir:  # compose mounted ~/.config/anthropic before anyone signed in
+        monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))
+    with pytest.raises(Unavailable, match="not signed in"):
+        asyncio.run(Claude().chat("s", [{"role": "user", "content": "hi"}]))
