@@ -1,14 +1,12 @@
-"""FRIDAY from any device. Pair your headphones with the device, then just run `friday`.
+"""FRIDAY from any device. Pair your headphones, run `friday`, talk.
 
-    friday login http://<box>:8080 <token>       once per device
     friday                                        talk: headphone mic in, FRIDAY's voice out, live transcript
                                                   (you can also type while it listens)
     friday ask "did a new model drop today?"     one question, one answer
-    friday chat                                   typed back-and-forth until Ctrl-D
-    friday watch                                  live transcript only, no mic
-    friday status | memory [query] | forget "…"   what FRIDAY knows and has learned
-    friday devices                                list mics and speakers (use --mic / --speaker N)
+    friday chat | watch | status | memory | forget | devices
 
+FRIDAY runs right on this device and keeps everything in ~/.friday. To share one FRIDAY across devices,
+run `friday serve` on an always-on machine and `friday login http://<it>:8080 <token>` everywhere else.
 FRIDAY_URL and FRIDAY_TOKEN override the saved login."""
 import argparse
 import asyncio
@@ -19,40 +17,116 @@ import sys
 
 import httpx
 
+from .config import HOME
+
 DIM, BOLD, CYAN, YELLOW, OFF = ("\033[2m", "\033[1m", "\033[36m", "\033[33m", "\033[0m") if sys.stdout.isatty() \
     else ("",) * 5
 
 
-CONFIG = os.path.join(os.path.expanduser("~"), ".config", "friday", "config.json")
+CONFIG = str(HOME / "config.json")  # this device's login (or its own local token), mode 0600
+
+
+def saved():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(**changes):
+    data = {**saved(), **changes}
+    data = {k: v for k, v in data.items() if v is not None}
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # tokens are keys to your life
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
 
 
 def login_settings():
-    saved = {}
-    try:
-        with open(CONFIG) as f:
-            saved = json.load(f)
-    except (OSError, ValueError):
-        pass
-    url = os.environ.get("FRIDAY_URL") or saved.get("url") or "http://localhost:8080"
-    token = os.environ.get("FRIDAY_TOKEN") or saved.get("token")
+    """(url, token) of the FRIDAY this device talks to, or None to run FRIDAY right here."""
+    conf = saved()
+    url = os.environ.get("FRIDAY_URL") or conf.get("url")
+    token = os.environ.get("FRIDAY_TOKEN") or conf.get("token")
+    if not url:
+        return None
     if not token:
-        sys.exit("Not logged in. Run: friday login http://<box>:8080 <FRIDAY_TOKEN>")
+        sys.exit("No token for that FRIDAY. Run: friday login <url> <token>")
     return url.rstrip("/"), token
 
 
-def client():
-    url, token = login_settings()
+def local_token():
+    token = saved().get("local_token")
+    if not token:
+        import secrets
+        token = secrets.token_urlsafe(24)
+        save(local_token=token)
+    return token
+
+
+def start_here(background, host="127.0.0.1", port=0):
+    """Run FRIDAY in this process: brain, memory, plugins, speech. Returns its URL and token."""
+    import shutil
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    from . import config
+    from .app import create_app
+    from .voice import Voice
+
+    config.load_env_file()
+    s = config.load()
+    s.token = s.token or local_token()
+    os.makedirs(s.skills_dir, exist_ok=True)
+    for skill in (config.PACKAGE / "starter_skills").iterdir():  # starters; never overwrite FRIDAY's own edits
+        if not os.path.exists(os.path.join(s.skills_dir, skill.name)):
+            shutil.copytree(skill, os.path.join(s.skills_dir, skill.name))
+    voice = Voice(piper_path=s.voice_path)
+    if not voice.available():
+        print(f"{DIM}Getting FRIDAY's voice ready (one-time download)…{OFF}", flush=True)
+        if not voice.ensure(s.voice):
+            print(f"{YELLOW}Couldn't download the voice; FRIDAY will answer in text.{OFF}")
+    if not port:
+        with socket.socket() as sock:
+            sock.bind((host, 0))
+            port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(create_app(s, background=background, voice=voice),
+                                           host=host, port=port, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    while not server.started:
+        time.sleep(0.05)
+    return f"http://{host}:{port}", s.token
+
+
+def client(background=False):
+    target = login_settings() or start_here(background)
+    url, token = target
     return httpx.Client(base_url=url, timeout=300, headers={"Authorization": f"Bearer {token}"})
 
 
 def cmd_login(a):
     c = httpx.Client(base_url=a.url.rstrip("/"), timeout=15, headers={"Authorization": f"Bearer {a.token}"})
     call(c, "GET", "/api/hud")  # proves the URL and token before saving them
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # the token is a key to your life
-    with os.fdopen(fd, "w") as f:
-        json.dump({"url": a.url.rstrip("/"), "token": a.token}, f)
-    print(f"Logged in to FRIDAY at {a.url}. Now run: friday")
+    save(url=a.url.rstrip("/"), token=a.token)
+    print(f"This device now talks to the FRIDAY at {a.url}. Run: friday")
+
+
+def cmd_logout(a):
+    save(url=None, token=None)
+    print("This device runs its own FRIDAY again.")
+
+
+def cmd_serve(a):
+    """Run the always-on FRIDAY that your other devices log in to."""
+    import time
+    url, token = start_here(background=True, host=a.host, port=a.port)
+    print(f"FRIDAY is running at {url}.")
+    print(f"On your other devices: friday login http://<this machine>:{a.port} {token}")
+    while True:
+        time.sleep(3600)
 
 
 def call(c, method, path, **kw):
@@ -61,7 +135,7 @@ def call(c, method, path, **kw):
     except httpx.HTTPError as e:
         sys.exit(f"Can't reach FRIDAY at {c.base_url}: {e}")
     if r.status_code == 401:
-        sys.exit("FRIDAY refused the token. Run friday login again.")
+        sys.exit("FRIDAY refused the token. Run friday login again (or friday logout to run FRIDAY here).")
     if r.status_code >= 400:
         sys.exit(f"FRIDAY said {r.status_code}: {r.text}")
     return r.json()
@@ -135,6 +209,26 @@ def show(m):
     return None
 
 
+def printer():
+    """Live transcript: FRIDAY's sentences appear on one line as they're spoken."""
+    mid = [False]
+
+    def out(m):
+        if m.get("type") == "say_part":
+            print((f"{CYAN}FRIDAY{OFF} " if not mid[0] else "") + m["text"], end=" ", flush=True)
+            mid[0] = True
+            return
+        if mid[0]:
+            print()
+            mid[0] = False
+            if m.get("type") == "say":
+                return  # already shown sentence by sentence
+        line = show(m)
+        if line:
+            print(line, flush=True)
+    return out
+
+
 def ws_url(c):
     return str(c.base_url).replace("http", "ws", 1).rstrip("/") + "/ws?token=" + c.headers["authorization"][7:]
 
@@ -145,10 +239,9 @@ def cmd_watch(c, a):
     async def run():
         async with websockets.connect(ws_url(c)) as ws:
             print(f"{DIM}Watching FRIDAY. Ctrl-C to stop.{OFF}")
+            out = printer()
             async for raw in ws:
-                line = show(json.loads(raw))
-                if line:
-                    print(line, flush=True)
+                out(json.loads(raw))
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
@@ -163,7 +256,7 @@ class Segmenter:
     """Turns a stream of (frame, is_speech) into utterances: speech, then `end_ms` of silence.
     Short blips (coughs, clicks) under `min_ms` are dropped; very long speech is cut at `max_ms`."""
 
-    def __init__(self, end_ms=700, min_ms=300, max_ms=30000):
+    def __init__(self, end_ms=600, min_ms=300, max_ms=30000):
         self.end, self.min, self.max = end_ms // FRAME_MS, min_ms // FRAME_MS, max_ms // FRAME_MS
         self.frames, self.voiced, self.silence = [], 0, 0
 
@@ -186,8 +279,12 @@ def cmd_devices(c, a):
     print(f"{DIM}Defaults are marked > (in) and < (out). Pick others with friday --mic N --speaker N.{OFF}")
 
 
+BARGE_IN_MS = 400  # this much of your voice while FRIDAY talks cuts it off
+
+
 def cmd_listen(c, a):
     """Voice mode: this device's mic (your paired headphones) is FRIDAY's ears; its speaker is FRIDAY's voice."""
+    import collections
     import io
     import wave
 
@@ -196,17 +293,16 @@ def cmd_listen(c, a):
     import webrtcvad
     import websockets
 
-    vad = webrtcvad.Vad(a.vad)
-    speaking = asyncio.Event()
+    vad, strict = webrtcvad.Vad(a.vad), webrtcvad.Vad(3)  # stricter while FRIDAY talks: ignore leakage
+    speaking, cut = asyncio.Event(), asyncio.Event()
 
-    def play(wav_b64):
+    def decode(wav_b64):
         with wave.open(io.BytesIO(base64.b64decode(wav_b64))) as w:
-            pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16)
-            sd.play(pcm, w.getframerate(), device=a.speaker, blocking=True)
+            return np.frombuffer(w.readframes(w.getnframes()), np.int16), w.getframerate()
 
     async def run():
         loop = asyncio.get_running_loop()
-        frames = asyncio.Queue()
+        frames, voice_q = asyncio.Queue(), asyncio.Queue()
         # Bluetooth headset mics often only run at their own rate: open at what the device supports, resample.
         rate = RATE
         try:
@@ -225,19 +321,41 @@ def cmd_listen(c, a):
             await ws.send(json.dumps({"type": "hello", "voice": True}))
 
             async def hear():
-                seg = Segmenter()
+                seg, recent, run_len = Segmenter(), collections.deque(maxlen=BARGE_IN_MS // FRAME_MS + 5), 0
                 with sd.RawInputStream(samplerate=rate, blocksize=block, device=a.mic, channels=1,
                                        dtype="int16", callback=on_audio):
                     name = sd.query_devices(a.mic, "input")["name"]
-                    print(f"{DIM}Listening on {name}. Say \"Friday…\", or type. Ctrl-C to stop.{OFF}", flush=True)
+                    print(f"{DIM}Listening on {name}. Talk to FRIDAY, or type. Ctrl-C to stop.{OFF}", flush=True)
                     while True:
                         frame = await frames.get()
                         if speaking.is_set():
-                            seg = Segmenter()  # don't send FRIDAY's own voice back to it
+                            recent.append(frame)
+                            run_len = run_len + 1 if strict.is_speech(frame, RATE) else 0
+                            if a.barge_in and run_len * FRAME_MS >= BARGE_IN_MS:  # you're talking over FRIDAY
+                                cut.set()
+                                while not voice_q.empty():  # the rest of this reply is moot
+                                    voice_q.get_nowait()
+                                await ws.send(json.dumps({"type": "interrupt"}))
+                                seg = Segmenter()
+                                for f in recent:  # keep what you already said
+                                    seg.push(f, True)
+                                run_len = 0
                             continue
                         pcm = seg.push(frame, vad.is_speech(frame, RATE))
                         if pcm:
                             await ws.send(json.dumps({"type": "audio", "pcm": base64.b64encode(pcm).decode()}))
+
+            async def speak():
+                while True:
+                    pcm, sr = decode(await voice_q.get())
+                    speaking.set()
+                    sd.play(pcm, sr, device=a.speaker)
+                    while sd.get_stream().active and not cut.is_set():
+                        await asyncio.sleep(0.03)
+                    if cut.is_set():
+                        sd.stop()
+                    if voice_q.empty():
+                        speaking.clear()
 
             async def type_():
                 while True:
@@ -248,21 +366,23 @@ def cmd_listen(c, a):
                         await ws.send(json.dumps({"type": "ask", "text": line.strip()}))
 
             async def talk():
+                out = printer()
                 async for raw in ws:
                     m = json.loads(raw)
                     if m.get("type") == "ready" and not m.get("voice"):
                         print(f"{YELLOW}No voice on this server: {m.get('why')}. Typing still works.{OFF}")
-                    line = show(m)
-                    if line:
-                        print(line, flush=True)
-                    if m.get("audio"):
-                        speaking.set()
-                        try:
-                            await asyncio.to_thread(play, m["audio"])
-                        finally:
-                            speaking.clear()
+                    if m.get("type") == "heard" and m.get("addressed"):
+                        cut.clear()  # a new turn: FRIDAY may speak again
+                        while not voice_q.empty():
+                            voice_q.get_nowait()
+                        speaking.clear()
+                    out(m)
+                    if m.get("audio") and not (cut.is_set() and m.get("type") == "say_part"):
+                        voice_q.put_nowait(m["audio"])
+                    if m.get("type") == "say":
+                        cut.clear()  # the interrupted reply is over; alerts and the next reply may speak
 
-            await asyncio.gather(hear(), type_(), talk())
+            await asyncio.gather(hear(), speak(), type_(), talk())
 
     try:
         asyncio.run(run())
@@ -275,10 +395,16 @@ def main(argv=None):
     p.add_argument("--mic", type=int, help="input device number (see friday devices); default: system default")
     p.add_argument("--speaker", type=int, help="output device number; default: system default")
     p.add_argument("--vad", type=int, default=2, choices=range(4), help="speech detection strictness, 0-3")
+    p.add_argument("--no-barge-in", dest="barge_in", action="store_false",
+                   help="don't stop FRIDAY when you talk over it (use with speakers instead of headphones)")
     sub = p.add_subparsers(dest="cmd")
-    lg = sub.add_parser("login", help="save the server URL and token on this device")
+    lg = sub.add_parser("login", help="use the FRIDAY running on another machine (shared memory)")
     lg.add_argument("url")
     lg.add_argument("token")
+    sub.add_parser("logout", help="go back to running FRIDAY on this device")
+    sv = sub.add_parser("serve", help="run the always-on FRIDAY your other devices log in to")
+    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--port", type=int, default=8080)
     for name, fn, arg, about in [
             ("listen", cmd_listen, None, "talk to FRIDAY (the default)"),
             ("ask", cmd_ask, "text", "one question, one answer"),
@@ -294,9 +420,10 @@ def main(argv=None):
             sp.add_argument(arg, nargs="+" if arg == "text" else "*")
         sp.set_defaults(fn=fn)
     a = p.parse_args(argv)
-    if a.cmd == "login":
-        return cmd_login(a)
-    (getattr(a, "fn", None) or cmd_listen)(client(), a)
+    if a.cmd in ("login", "logout", "serve"):
+        return {"login": cmd_login, "logout": cmd_logout, "serve": cmd_serve}[a.cmd](a)
+    fn = getattr(a, "fn", None) or cmd_listen
+    fn(client(background=fn in (cmd_listen, cmd_watch)), a)
 
 
 if __name__ == "__main__":

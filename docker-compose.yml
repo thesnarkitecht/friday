@@ -1,5 +1,5 @@
-# FRIDAY in one container: server, speech (Whisper + Piper), plugins, and every credential (from .env).
-# Ears and voice are any device running the `friday` CLI with headphones paired: no audio setup here.
+# Optional: an always-on FRIDAY hub, so every device shares one memory. Same install as any device,
+# running `friday serve`. Devices join with: friday login http://<this machine>:8080 <FRIDAY_TOKEN>
 services:
   friday:
     build: ./server
@@ -8,6 +8,6 @@ services:
     ports:
       - "8080:8080"   # keep this on your LAN / Tailscale only
     volumes:
-      - ./data:/data                                   # memory db, FRIDAY's skills, whisper models
-      - ./server/plugins:/app/plugins:ro               # add plugins without rebuilding
+      - ./data:/data                                   # memory, FRIDAY's skills, speech models
+      - ./plugins:/data/plugins:ro                     # your own plugins (built-ins ship inside)
       - ${HOME}/.config/anthropic:/root/.config/anthropic:ro   # `ant auth login` profile

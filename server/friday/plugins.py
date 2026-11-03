@@ -1,4 +1,5 @@
-"""Plugins: one folder each under plugins/, with plugin.py defining setup(p). No MCP servers.
+"""Plugins: one folder each with plugin.py defining setup(p). No MCP servers. Built-ins ship in
+friday/builtin_plugins; add your own in ~/.friday/plugins/<name>/plugin.py.
 
 A plugin can add:
   - tools the brain calls:     @p.tool("what it does", arg=("string", "meaning"))
@@ -40,10 +41,10 @@ class Plugin:
         await self.state.notify(kind, text, urgent=urgent)
 
 
-def load(root, state, tools):
-    """Import every plugins/<name>/plugin.py. A broken plugin is reported and skipped, never fatal."""
+def load(roots, state, tools):
+    """Import every <root>/<name>/plugin.py. A broken plugin is reported and skipped, never fatal."""
     plugins, errors = [], []
-    for f in sorted(Path(root).glob("*/plugin.py")):
+    for f in [f for r in roots for f in sorted(Path(r).glob("*/plugin.py"))]:
         name = f.parent.name
         try:
             spec = importlib.util.spec_from_file_location(f"friday_plugin_{name}", f)

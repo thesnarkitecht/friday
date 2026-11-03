@@ -15,7 +15,8 @@ create table if not exists facts(id integer primary key, ts real, category text,
     importance real, source text);
 create virtual table if not exists facts_fts using fts5(text);
 create table if not exists episodes(day text primary key, summary text);
-create table if not exists reminders(id integer primary key, due real, text text, done int default 0);
+create table if not exists reminders(id integer primary key, due real, text text, done int default 0,
+    kind text default 'reminder');
 create table if not exists devices(addr text primary key, person text);
 create table if not exists seen(key text primary key, ts real);
 create table if not exists notifications(id integer primary key, ts real, kind text, text text);
@@ -50,10 +51,15 @@ def importance(text):
 
 
 CONSOLIDATE = (
-    "You are the memory of a personal assistant. Below is part of today's raw transcript. Summarize it in "
-    "2-4 sentences, pull out durable facts about the owner still useful in a month (interests, preferences, "
-    "work, places, commitments; skip small talk and other people's private matters), and any reminders with "
-    "an ISO-8601 local due time.\n\n")
+    "You are the memory of a personal assistant that talks to its owner all day. Below is part of today's raw "
+    "transcript. Summarize it in 2-4 sentences. Pull out durable facts about the owner still useful in a month "
+    "(interests, preferences, work, places, commitments, and rapport: running jokes, nicknames, how they like "
+    "to be talked to); skip small talk and other people's private matters. List reminders the owner asked for "
+    "(kind 'reminder'), and check-ins: things they were planning, waiting on or nervous about that a good "
+    "friend would ask about afterwards, phrased as that question, due a little after the event (kind "
+    "'checkin', e.g. 'How did the interview go?'). Due times are ISO-8601 local. Finally, if you notice one "
+    "pattern worth mentioning (something they keep asking about, a recurring frustration, a habit), write "
+    "it as one short, friendly offer of help; otherwise leave it empty.\n\n")
 
 
 class Fact(BaseModel):
@@ -65,12 +71,14 @@ class Fact(BaseModel):
 class Reminder(BaseModel):
     text: str
     due: str
+    kind: str = "reminder"  # reminder | checkin
 
 
 class Digest(BaseModel):
     summary: str
     facts: list[Fact]
     reminders: list[Reminder]
+    observation: str = ""
 
 
 QUESTIONS = (
@@ -123,6 +131,10 @@ class Memory:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        try:  # databases from before check-ins existed
+            self.db.execute("alter table reminders add column kind text default 'reminder'")
+        except sqlite3.OperationalError:
+            pass
         self.retain_days, self.keep_importance, self.record_others = retain_days, keep_importance, record_others
 
     # --- transcripts -----------------------------------------------------
@@ -185,13 +197,15 @@ class Memory:
         return out
 
     # --- reminders / devices / dedupe ------------------------------------
-    def add_reminder(self, text, due_ts):
-        self.db.execute("insert into reminders(due, text) values(?, ?)", (due_ts, text))
+    def add_reminder(self, text, due_ts, kind="reminder"):
+        self.db.execute("insert into reminders(due, text, kind) values(?, ?, ?)", (due_ts, text, kind))
         self.db.commit()
 
-    def due_reminders(self, now=None):
+    def due_reminders(self, now=None, kind="reminder"):
+        """kind "checkin": things FRIDAY heard you planning and will ask about afterwards."""
         now = now or time.time()
-        rows = self.db.execute("select id, text from reminders where done = 0 and due <= ?", (now,)).fetchall()
+        rows = self.db.execute("select id, text from reminders where done = 0 and due <= ? and kind = ?",
+                               (now, kind)).fetchall()
         self.db.executemany("update reminders set done = 1 where id = ?", [(r["id"],) for r in rows])
         self.db.commit()
         return [r["text"] for r in rows]
@@ -323,13 +337,14 @@ class Memory:
         day = datetime.fromtimestamp(rows[0]["ts"]).strftime("%Y-%m-%d")
         lines = [f"{datetime.fromtimestamp(r['ts']):%H:%M} [{r['speaker']}|imp {r['importance']}] {r['text']}"
                  for r in rows]
-        data = {"summary": "", "facts": [], "reminders": []}
+        data = {"summary": "", "facts": [], "reminders": [], "observations": []}
         for chunk in _chunks(lines, chunk_chars):  # small context windows: digest the day in bites
             part = await llm.decide(CONSOLIDATE + chunk, Digest, effort="medium")
             if part:
                 data["summary"] = " ".join(x for x in (data["summary"], part.summary) if x)
                 data["facts"] += [f.model_dump() for f in part.facts]
                 data["reminders"] += [r.model_dump() for r in part.reminders]
+                data["observations"] += [part.observation.strip()] if part.observation.strip() else []
         if data["summary"]:
             self.db.execute("insert or replace into episodes values(?, coalesce((select summary from episodes "
                             "where day = ?) || ' ', '') || ?)", (day, day, data["summary"]))
@@ -338,9 +353,12 @@ class Memory:
                 self.remember(f["text"], f.get("category", "other"), float(f.get("importance", 0.6)), "consolidated")
         for r in data["reminders"]:
             try:
-                self.add_reminder(r["text"], datetime.fromisoformat(r["due"]).timestamp())
+                kind = r.get("kind") if r.get("kind") in ("reminder", "checkin") else "reminder"
+                self.add_reminder(r["text"], datetime.fromisoformat(r["due"]).timestamp(), kind)
             except (KeyError, ValueError, TypeError):
                 pass
+        if data["observations"]:
+            self.hold("insight", data["observations"][0])  # one pattern a day, at the next good moment
         ids = [(r["id"],) for r in rows]
         self.db.executemany("update utterances set consolidated = 1 where id = ?", ids)
         self._purge(now)

@@ -1,16 +1,12 @@
+# The always-on FRIDAY hub: the same install as every device, running `friday serve`.
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt requirements-voice.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-voice.txt
-# Speech runs here (Whisper in, Piper out) so the devices with headphones stay light. Voice baked in.
-RUN mkdir -p /opt/voices && python -m piper.download_voices --data-dir /opt/voices en_US-lessac-medium
-COPY friday ./friday
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir --no-deps . && rm -rf build  # the `friday` CLI inside the container
-COPY plugins ./plugins
-COPY skills ./skills.seed
-COPY start.sh ./
-ENV FRIDAY_DB=/data/friday.db FRIDAY_SKILLS_DIR=/data/skills FRIDAY_PLUGINS_DIR=/app/plugins \
-    FRIDAY_PIPER_VOICE=/opt/voices/en_US-lessac-medium.onnx HF_HOME=/data/hf
+COPY . .
+RUN pip install --no-cache-dir . && rm -rf build
+# FRIDAY_URL: `docker compose exec friday friday ask …` talks to this hub instead of starting a second FRIDAY.
+ENV FRIDAY_HOME=/data FRIDAY_PIPER_VOICE=/opt/voices/en_GB-jenny_dioco-medium.onnx HF_HOME=/data/hf \
+    FRIDAY_URL=http://127.0.0.1:8080
+# Voice baked in so the container needs no download at runtime.
+RUN python -m piper.download_voices --data-dir /opt/voices en_GB-jenny_dioco-medium
 EXPOSE 8080
-CMD ["./start.sh"]
+CMD ["friday", "serve", "--host", "0.0.0.0", "--port", "8080"]

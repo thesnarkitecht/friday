@@ -1,43 +1,8 @@
 # FRIDAY guide: setup, headphones, plugins, and how it decides to speak
 
-FRIDAY has two parts:
-- **The server** (one Docker container on an always-on box) holds the brain, memory, plugins, speech
-  recognition and voice.
-- **The `friday` command** runs on any device you carry or sit at (laptop, desktop, a Pi) and uses whatever
-  headphones are paired with that device as FRIDAY's ears and voice. The device does almost no work, so
-  anything that runs Python 3.10+ is enough.
+## Setup (one device)
 
-## What you need
-
-| Item | Why | Cost |
-|---|---|---|
-| An always-on box: a mini PC, home server, or Raspberry Pi 5 (8 GB) | Runs the container. Whisper `base.en` is comfortable on a Pi 5; use `tiny.en` if it lags | about $80+ |
-| Headphones or earbuds with a mic, paired to the device you're using | Ears and voice | — |
-| A Claude sign-in or API key | The brain | API usage |
-| *Optional:* room radars (below) | Tells FRIDAY when you have company at home | about $20/room |
-| *Optional:* Hermes Agent running somewhere | Heavy research and coding | free (MIT) |
-| *Optional:* Tailscale on the box and your devices | Reach FRIDAY from anywhere, not just home Wi-Fi | free personal plan |
-
-## 1. Start the server
-
-```bash
-cp .env.example .env
-```
-
-Set `FRIDAY_TOKEN` (long and random), `FRIDAY_OWNER_NAME`, and any plugin settings. For Claude, either:
-- **Sign in:** install the `ant` CLI on the box and run `ant auth login`. Compose mounts that profile into
-  the container read-only.
-- **API key:** set `ANTHROPIC_API_KEY` in `.env`.
-
-A Claude Pro/Max chat subscription can't power a third-party server like this; it bills as API usage.
-
-```bash
-docker compose up -d --build
-```
-
-## 2. Set up each device
-
-Pair your headphones with the device the normal way (Bluetooth settings), then:
+You need headphones or earbuds with a mic, paired with the device, and a Claude sign-in or API key.
 
 ```bash
 pip install ./server
@@ -46,28 +11,64 @@ pip install ./server
 On Linux, also install PortAudio for the mic: `sudo apt install libportaudio2`. macOS and Windows need nothing extra.
 
 ```bash
-friday login http://<box>:8080 <FRIDAY_TOKEN>
+ant auth login
 ```
+
+Or put `ANTHROPIC_API_KEY=…` in `~/.friday/.env`. A Claude Pro/Max chat subscription can't power an app
+like this; it bills as API usage.
 
 ```bash
 friday
 ```
 
-That's it: you're talking to FRIDAY. You see a live transcript, FRIDAY's voice comes through your
-headphones, and you can type at the same time. It uses the device's default mic and speaker; with
-Bluetooth headphones connected, those are usually the headphones. `friday devices` lists everything, and
-`friday --mic 3 --speaker 5` picks specific ones.
+The first run downloads FRIDAY's voice (about 60 MB) and speech recognition model (about 150 MB), once.
+After that you see a live transcript, FRIDAY's voice comes through your headphones, and you can type at
+the same time.
 
-On Linux, Bluetooth headphones only have a mic in "headset" mode. Pick it in your sound settings, or:
+It uses the device's default mic and speaker; with Bluetooth headphones connected, those are usually the
+headphones. `friday devices` lists everything, and `friday --mic 3 --speaker 5` picks specific ones. On
+Linux, Bluetooth headphones only have a mic in "headset" mode. Pick it in your sound settings, or:
 
 ```bash
 pactl set-card-profile bluez_card.<MAC_with_underscores> headset-head-unit
 ```
 
-Several devices can be connected at once. Every one sees the conversation, and the ones in voice mode
-hear FRIDAY.
+Settings and plugin credentials go in `~/.friday/.env` (copy `.env.example`). Everything FRIDAY keeps is
+in `~/.friday`: memory (`friday.db`), its skills, the voice, and this device's login.
 
-## 3. Talking to it
+**Laptop speakers instead of headphones?** Run `friday --no-barge-in`, or FRIDAY may hear itself and stop.
+
+## Sharing one FRIDAY across devices (optional)
+
+On an always-on machine (mini PC, home server, Pi 5), either:
+
+```bash
+FRIDAY_TOKEN=<long random string> friday serve
+```
+
+or, with Docker, put the same settings in `.env` next to `docker-compose.yml` and run:
+
+```bash
+docker compose up -d --build
+```
+
+The hub preloads the speech models, so the first answer is as quick as the rest. On every other device:
+
+```bash
+friday login http://<hub>:8080 <FRIDAY_TOKEN>
+```
+
+Now they share one memory, one set of skills, and one personality, and every connected device sees the
+conversation. `friday logout` goes back to a FRIDAY of the device's own. Use Tailscale to reach the hub
+from outside your home network; never expose port 8080 to the internet.
+
+| Hardware for a hub | Notes |
+|---|---|
+| Raspberry Pi 5 (8 GB), mini PC, or home server | Whisper `base.en` is comfortable on a Pi 5; set `FRIDAY_WHISPER_MODEL=tiny.en` if it lags |
+| *Optional:* room radars (below) | Tells FRIDAY when you have company at home |
+| *Optional:* Hermes Agent | Heavy research and coding |
+
+## Talking to it
 
 - **"Friday, …"** always works.
 - **Follow-ups** for 10 seconds after FRIDAY speaks need no name.
@@ -76,6 +77,11 @@ hear FRIDAY.
   loud. With company, you need its name.
 - **It knows what you were just talking about.** When you ask, FRIDAY also sees the last 5 minutes of
   what was said around you, so "Friday, what do you think?" or "look that up" works without repeating yourself.
+- **Talk over it** to cut it off: about half a second of your voice stops FRIDAY mid-sentence, and what
+  you said is heard as your next request.
+- **It starts things too:** a greeting when you put your headphones on after 4+ hours away
+  (`FRIDAY_GREET_AFTER_HOURS`), check-ins on plans it heard ("How did the interview go?"), one pattern it
+  noticed overnight, and now and then a question about your tastes.
 
 | Command | What it does |
 |---|---|
@@ -88,20 +94,21 @@ hear FRIDAY.
 | `friday memory [query]` | What it knows about you, or a search |
 | `friday forget "…"` | Delete facts containing that text |
 | `friday devices` | List mics and speakers |
+| `friday login <url> <token>` / `friday logout` | Use a shared hub / go back to this device's own FRIDAY |
+| `friday serve` | Be the hub other devices log in to |
 
-Inside the server container the same command works without logging in:
-`docker compose exec friday friday ask "…"`.
+Inside the hub container the same commands work: `docker compose exec friday friday ask "…"`.
 
 ## OpenAI-compatible clients
 
-Base URL `http://<box>:8080/v1`, API key = `FRIDAY_TOKEN`, model `friday`. `/v1/models` and
+Base URL `http://<hub>:8080/v1`, API key = `FRIDAY_TOKEN`, model `friday`. `/v1/models` and
 `/v1/chat/completions` (with or without streaming) are supported. FRIDAY keeps its own memory and
 history, so it only reads the latest user message; the client's system prompt and earlier turns are ignored.
 
 ## How FRIDAY decides to speak
 
 - **Always, right away:** reminders you set, routines you scheduled, Hermes reporting back.
-- **Everything else** (new models, Hacker News, any plugin feed) goes through two checks:
+- **Everything else** (new models, Hacker News, check-ins, patterns, any plugin feed) goes through two checks:
   1. **Company and quiet hours.** If room radars count more than one person, another voice was heard in
      the last 2 minutes, or it's quiet hours (`FRIDAY_QUIET_HOURS`, 22–8 by default), it waits. When
      company leaves or you next talk to FRIDAY, you get one line: "Catching you up: …".
@@ -120,7 +127,7 @@ history, so it only reads the latest user message; the client's system prompt an
 - **Raw speech:** deleted after the nightly pass (3:00) unless it scored as worth keeping (commitments,
   dates, preferences). Other people's words are always deleted then. Audio is never stored.
 - **Facts about you:** kept, shown in `/api/memory`. Say "Friday, forget that I …" to delete one.
-- **Skills:** `data/skills/`, plain Markdown you can read and edit.
+- **Skills:** `~/.friday/skills/`, plain Markdown you can read and edit.
 
 ## Plugins
 
@@ -135,10 +142,11 @@ Built in:
 To connect Hermes, turn on its API server (`API_SERVER_ENABLED=true`, `API_SERVER_KEY=…` in Hermes'
 `.env`, then `hermes gateway`). Then set `HERMES_URL=http://<host>:8642/v1` and `HERMES_KEY` to the same key.
 
-Writing one: make `server/plugins/<name>/plugin.py` with `def setup(p):`. Use `@p.tool(...)` for things
-Claude can call, `@p.feed(every_s=...)` for zero-token checks returning `{"key", "kind", "text"}` items,
-`p.env("NAME")` for credentials, and an optional `skills/` folder. The plugins folder is mounted, so a
-restart picks up changes without rebuilding.
+Writing one: make `~/.friday/plugins/<name>/plugin.py` (on the hub with Docker: `plugins/<name>/` next to
+`docker-compose.yml`) with `def setup(p):`. Use `@p.tool(...)` for things Claude can call,
+`@p.feed(every_s=...)` for zero-token checks returning `{"key", "kind", "text"}` items, `p.env("NAME")`
+for credentials from `.env`, and an optional `skills/` folder. Restart FRIDAY to load it; `friday status`
+lists plugins that failed to load and why.
 
 ## Room radars (optional)
 

@@ -1,19 +1,19 @@
 # How FRIDAY works
 
-The server is one Docker container. Ears and voice are any device running the `friday` command with
-headphones paired.
+One install (`pip install ./server`) is all of it. `friday` runs everything below on the device; with
+`friday serve` on an always-on machine, other devices log in and only their headphone audio travels.
 
 ## The whole agent
 
 ```mermaid
 flowchart TB
-    subgraph DEVICE["Any device: friday CLI + paired headphones"]
+    subgraph DEVICE["Any device: friday + paired headphones"]
         buds["Headphone mic + speaker"]
-        vad["Speech detection<br/>cuts utterances"]
+        vad["Speech detection<br/>cuts utterances · barge-in stops FRIDAY"]
         typed["Typing, friday ask,<br/>OpenAI clients"]
     end
 
-    subgraph SERVER["FRIDAY server (one container)"]
+    subgraph SERVER["FRIDAY engine (same process, or a shared hub)"]
         stt["Whisper<br/>speech → text"]
         tts["Piper<br/>text → speech"]
         hear["hear()<br/>score + remember every line"]
@@ -22,7 +22,7 @@ flowchart TB
         subgraph BRAIN["Brain"]
             prefix["Cached prefix<br/>persona + skill index + tools"]
             ctx["Per-turn [context]<br/>time · situation · last 5 min overheard<br/>8 facts · 4 memories"]
-            claude(["Claude<br/>ant auth login / API key"])
+            claude(["Claude, streaming<br/>each sentence spoken as written"])
             tools["Tools<br/>remember · forget · recall · reminders<br/>routines · skill_view · skill_save<br/>+ plugin tools"]
         end
 
@@ -32,13 +32,13 @@ flowchart TB
         subgraph PRO["Proactive loop (every minute)"]
             due["Reminders · routines"]
             feeds["Plugin feeds, plain HTTP, zero tokens<br/>new models (OpenRouter) · Hacker News"]
-            ask["One preference question a day<br/>at a quiet moment"]
+            ask["Greeting when headphones go on<br/>check-ins · one question a day"]
             gate{"Speak now?<br/>urgent → yes<br/>company or quiet hours → hold<br/>learned score below 0.4 → hold"}
             held[("Held for a good moment")]
         end
 
         subgraph NIGHT["3am sleep pass (typed outputs)"]
-            keep["Keep what matters<br/>facts · summary · reminders<br/>delete the rest"]
+            keep["Keep what matters<br/>facts · rapport · summary · reminders<br/>check-ins · one pattern<br/>delete the rest"]
             review["Rebuild micro skills<br/>from today's tool use"]
             newq["Think of new<br/>preference questions"]
         end

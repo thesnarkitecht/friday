@@ -15,6 +15,7 @@ async def tick(state, now=None):
             said.append(("routine", await state.brain.respond(f"(Scheduled routine, nobody asked just now.) {task}")))
         except Exception as e:
             said.append(("error", f"Routine '{task}' failed: {type(e).__name__}"))
+    said += [("checkin", text) for text in state.memory.due_reminders(now, kind="checkin")]  # "how'd it go?"
     for kind, text in said:
         await state.notify(kind, text)
     said += await plugins.poll(state.plugins, state.memory, state.notify, now)  # zero-token checks

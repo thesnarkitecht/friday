@@ -26,10 +26,12 @@ class FakeLLM:
     def __init__(self, *replies):
         self.replies, self.sent = list(replies), []
 
-    async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000):
+    async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000, on_text=None):
         self.sent.append({"system": system, "messages": list(messages), "tools": list(tools)})
         r = self.replies.pop(0) if self.replies else "ok"
         if isinstance(r, str):
+            for word in r.split(" ") if on_text else []:  # stream it word by word, like Claude
+                await on_text(word + " ")
             return {"stop": "end_turn", "content": [{"type": "text", "text": r}], "text": r, "tool_uses": []}
         content = [{"type": "tool_use", **u} for u in r["tool_uses"]]
         return {"stop": "tool_use", "content": content, "text": "", "tool_uses": r["tool_uses"]}
@@ -40,6 +42,15 @@ class FakeLLM:
         return schema.model_validate(r) if isinstance(r, dict) else r
 
 
+def until_said(ws):
+    """Read a reply: spoken sentence parts, then the full text. Returns (parts, final say message)."""
+    parts = []
+    while (m := ws.receive_json())["type"] == "say_part":
+        parts.append(m)
+    assert m["type"] == "say"
+    return parts, m
+
+
 def use(name, **inp):
     return {"tool_uses": [{"id": "t1", "name": name, "input": inp}]}
 
@@ -47,8 +58,9 @@ def use(name, **inp):
 def settings(tmp_path, **kw):
     s = config.load()
     s.token, s.db, s.owner = "secret", str(tmp_path / "f.db"), "Ryan"
-    s.skills_dir, s.plugins_dir = str(tmp_path / "skills"), str(tmp_path / "plugins")
+    s.skills_dir, s.plugin_roots = str(tmp_path / "skills"), [str(tmp_path / "plugins")]
     s.quiet_hours = (0, 0)  # tests run at any hour; quiet hours have their own test
+    s.greet_after_h = 0  # greetings have their own test
     s.__dict__.update(kw)
     return s
 
@@ -156,7 +168,8 @@ def test_tool_call_and_reply_reach_every_client(tmp_path):
             a.send_json({"type": "utterance", "text": "Friday, I'm into local LLMs"})
             for ws in (a, b):
                 assert ws.receive_json()["type"] == "heard"
-                assert ws.receive_json() == {"type": "say", "text": "Noted."}
+                parts, say = until_said(ws)
+                assert [p["text"] for p in parts] == ["Noted."] and say["text"] == "Noted." and say["spoken"]
     assert app.state.friday.memory.interests() == ["local LLMs"]
     result = llm.sent[1]["messages"][-1]["content"][0]
     assert result["type"] == "tool_result" and result["tool_use_id"] == "t1"
@@ -231,7 +244,7 @@ def test_a_feed_that_is_not_set_up_keeps_its_first_quiet_look(tmp_path):
 
 
 def test_models_plugin_filters_labs_and_variants():
-    mod = module("plugins/models/plugin.py")
+    mod = module("friday/builtin_plugins/models/plugin.py")
     data = {"data": [{"id": "anthropic/claude-x", "name": "Claude X"}, {"id": "openai/gpt-9:free"},
                      {"id": "randolab/thing"}]}
     assert mod.new_models(data, {"anthropic", "openai"}) == [
@@ -239,7 +252,7 @@ def test_models_plugin_filters_labs_and_variants():
 
 
 def test_hackernews_plugin_matches_whole_words_with_traction():
-    mod = module("plugins/hackernews/plugin.py")
+    mod = module("friday/builtin_plugins/hackernews/plugin.py")
     hits = [{"objectID": "1", "title": "Rust 2.0 released", "points": 300},
             {"objectID": "2", "title": "Trusting trust revisited", "points": 300},
             {"objectID": "3", "title": "My Rust side project", "points": 4}]
@@ -256,7 +269,7 @@ def test_hermes_plugin_hands_off_then_reports_back(tmp_path, monkeypatch):
         return httpx.Response(200, json={"choices": [{"message": {"content": "Use uv.\nDetails here."}}]})
 
     import shutil
-    shutil.copytree("plugins/hermes", tmp_path / "plugins" / "hermes")
+    shutil.copytree("friday/builtin_plugins/hermes", tmp_path / "plugins" / "hermes")
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = create_app(settings(tmp_path), llm=FakeLLM(), background=False, http=http)
     f = app.state.friday
@@ -440,7 +453,7 @@ def test_cli_drives_friday(tmp_path, monkeypatch, capsys):
     from friday import cli
     app = create_app(settings(tmp_path), llm=FakeLLM("Two new models today."), background=False)
     with TestClient(app, headers=H) as c:
-        monkeypatch.setattr(cli, "client", lambda: c)
+        monkeypatch.setattr(cli, "client", lambda **kw: c)
         cli.main(["ask", "anything", "new?"])
         assert "Two new models today." in capsys.readouterr().out
         app.state.friday.addressee.last_spoke = 0  # follow-up window closed
@@ -507,11 +520,11 @@ def test_a_headphone_device_talks_and_hears_friday(tmp_path):
             phone.send_json({"type": "audio", "pcm": "not base64!!"})  # ignored, connection survives
             phone.send_json({"type": "audio", "pcm": base64.b64encode(b"\0" * 3200).decode()})
             assert phone.receive_json()["text"] == "Friday, did a new model drop?"
-            said = phone.receive_json()
-            assert said["text"] == "Yes, two this morning."
-            assert base64.b64decode(said["audio"]) == b"RIFFYes, two this morning."  # voice device gets speech
+            parts, say = until_said(phone)
+            assert [base64.b64decode(p["audio"]) for p in parts] == [b"RIFFYes, two this morning."]
+            assert "audio" not in say  # already spoken sentence by sentence
             laptop.receive_json()
-            assert "audio" not in laptop.receive_json()  # text-only device gets text
+            assert all("audio" not in p for p in until_said(laptop)[0])  # text-only device gets text
     assert voice.heard == [3200]
 
 
@@ -532,7 +545,7 @@ def test_typing_while_listening_always_reaches_friday(tmp_path):
         ws.receive_json()
         ws.send_json({"type": "ask", "text": "look that up"})  # no wake word needed when typed
         assert ws.receive_json() == {"type": "heard", "text": "look that up", "addressed": True}
-        assert ws.receive_json() == {"type": "say", "text": "On it."}
+        assert until_said(ws)[1]["text"] == "On it."
 
 
 def test_friday_knows_what_you_were_just_talking_about(tmp_path):
@@ -563,3 +576,107 @@ def test_login_saves_url_and_token_privately(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         cli.main(["login", "http://testserver", "wrong"])  # a bad token is never saved
     assert cli.login_settings()[1] == "secret"
+
+
+def test_friday_speaks_each_sentence_as_soon_as_it_is_written(tmp_path):
+    voice = FakeVoice()
+    reply = "Two new models dropped. One is from Anthropic! Want details?"
+    app = create_app(settings(tmp_path), llm=FakeLLM(reply), background=False, voice=voice)
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "hello", "voice": True}); ws.receive_json()
+        ws.send_json({"type": "ask", "text": "anything new?"}); ws.receive_json()
+        parts, say = until_said(ws)
+    assert [p["text"] for p in parts] == ["Two new models dropped.", "One is from Anthropic!", "Want details?"]
+    assert say["text"] == reply
+
+
+def test_talking_over_friday_stops_it(tmp_path):
+    gate = asyncio.Event()
+
+    class Slow(FakeLLM):
+        async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000, on_text=None):
+            await on_text("First sentence. Sec")
+            await gate.wait()  # still writing when the owner cuts in
+            await on_text("ond sentence. Third.")
+            return {"stop": "end_turn", "content": [], "text": "First sentence. Second sentence. Third.", "tool_uses": []}
+
+    app = create_app(settings(tmp_path), llm=Slow(), background=False)
+    f = app.state.friday
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "ask", "text": "tell me a story"}); ws.receive_json()
+        first = ws.receive_json()
+        assert first == {"type": "say_part", "text": "First sentence."}
+        ws.send_json({"type": "interrupt"})
+        while not f.hush:
+            time.sleep(0.01)
+        c.portal.call(gate.set)
+        parts, say = until_said(ws)
+        assert parts == [] and say["text"] == "First sentence. Second sentence. Third."
+
+
+
+def test_one_install_runs_friday_right_here(tmp_path, monkeypatch, capsys):
+    """No server, no login: `friday ask` starts FRIDAY in-process (real HTTP server thread) and answers."""
+    from friday import app as app_module, cli, voice as voice_module
+    monkeypatch.setattr(cli, "CONFIG", str(tmp_path / "config.json"))
+    for k in ("FRIDAY_URL", "FRIDAY_TOKEN", "FRIDAY_DB", "FRIDAY_SKILLS_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FRIDAY_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(app_module, "Claude", lambda model: FakeLLM("Hello from your own machine."))
+    monkeypatch.setattr(voice_module.Voice, "available", lambda self: True)  # skip the voice download
+    cli.main(["ask", "are you there?"])
+    assert "Hello from your own machine." in capsys.readouterr().out
+    assert (tmp_path / "home" / "friday.db").exists()
+    assert (tmp_path / "home" / "skills" / "morning-briefing" / "SKILL.md").exists()  # starter skills seeded
+    token = json.load(open(cli.CONFIG))["local_token"]
+    assert len(token) > 20 and cli.login_settings() is None  # local mode, private token kept
+
+
+
+# --- personality ------------------------------------------------------------------------------
+def test_friday_greets_you_when_you_put_headphones_on(tmp_path):
+    llm = FakeLLM("Morning. Coffee first, or the news?")
+    app = create_app(settings(tmp_path, greet_after_h=4), llm=llm, background=False, voice=FakeVoice())
+    f = app.state.friday
+    f.memory.hold("models", "New model just showed up: Claude X.")
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "hello", "voice": True})
+        assert ws.receive_json()["type"] == "ready"
+        parts, say = until_said(ws)
+        assert say["text"] == "Morning. Coffee first, or the news?" and all(p["audio"] for p in parts)
+        catch_up = ws.receive_json()
+        assert catch_up["type"] == "notify" and "Claude X" in catch_up["text"]  # then what it held
+    assert "just put their headphones on" in llm.sent[0]["messages"][-1]["content"]
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:  # back a minute later: no repeat
+        ws.receive_json()
+        ws.send_json({"type": "hello", "voice": True}); ws.receive_json()
+        ws.send_json({"type": "ask", "text": "hi"})
+        assert ws.receive_json()["type"] == "heard"
+
+
+def test_friday_checks_in_on_plans_it_heard_and_shares_patterns(tmp_path):
+    m = Memory(str(tmp_path / "m.db"))
+    m.add_utterance("big interview tomorrow at 10, kind of nervous", speaker="owner", ts=time.time() - 60)
+    llm = FakeLLM({"summary": "Interview prep.", "facts": [], "observation": "You've asked about GPUs five times "
+                   "this week; want me to watch for price drops?", "reminders": [
+                       {"text": "How did the interview go?", "due": "2030-01-01T12:00:00", "kind": "checkin"}]})
+    asyncio.run(m.consolidate(llm))
+    assert m.due_reminders(now=1.9e9) == []  # not a plain reminder
+    assert m.due_reminders(now=1.9e9, kind="checkin") == ["How did the interview go?"]
+    assert m.release() == [("insight", "You've asked about GPUs five times this week; want me to watch for "
+                                       "price drops?")]
+
+
+def test_a_reply_to_a_check_in_has_context(tmp_path):
+    llm = FakeLLM("Knew you'd nail it.")
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    f = app.state.friday
+    with TestClient(app) as c:
+        asyncio.run(f.notify("checkin", "How did the interview go?"))
+        c.post("/api/utterance", json={"text": "it went great"}, headers=H)  # no wake word: follow-up window
+    msgs = llm.sent[0]["messages"]
+    assert msgs[0]["role"] == "user"  # the API's rule, kept without losing FRIDAY's question
+    assert msgs[-2] == {"role": "assistant", "content": "How did the interview go?"}

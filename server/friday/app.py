@@ -29,6 +29,7 @@ URGENT = {"reminder", "error", "routine"}
 INTERRUPT, FEEDBACK_S = 0.4, 90  # below INTERRUPT a kind waits for the next good moment
 VOICE_COMPANY_S = 120  # someone else spoke this recently: you're probably talking with them
 ANSWER_S = 120  # a reply this soon after FRIDAY asks a question is the answer
+SENTENCE_END = re.compile(r"[.!?](\s+)(?=\S)")  # a sentence is done once the next one has started
 PUSHBACK = re.compile(r"\b(stop|enough|shut up|quiet|not now|later|don'?t care|who cares|not interested|"
                       r"don'?t (tell|need|want)|i know|whatever|no one asked|annoying)\b", re.I)
 
@@ -38,18 +39,20 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     if not s.token:
         raise RuntimeError("Set FRIDAY_TOKEN: the server holds your life, it doesn't run unauthenticated.")
     state = SimpleNamespace(settings=s, clients=set(), voice_clients=set())
-    state.voice = voice or Voice()
+    state.voice = voice or Voice(piper_path=s.voice_path)
+    state.turn_lock, state.tasks, state.hush = asyncio.Lock(), set(), False
     state.llm = llm or Claude(s.model)
     state.http = http or httpx.AsyncClient(timeout=20, headers={"User-Agent": "friday-assistant"})
+    Path(s.db).parent.mkdir(parents=True, exist_ok=True)
     state.memory = Memory(s.db, s.retain_days, s.keep_importance, s.record_others)
     state.memory.add_questions(SEED_QUESTIONS)
-    state.skills = Skills(s.skills_dir, extra=sorted(Path(s.plugins_dir).glob("*/skills")))
+    state.skills = Skills(s.skills_dir, extra=[d for r in s.plugin_roots for d in sorted(Path(r).glob("*/skills"))])
     state.addressee = Addressee()
 
     async def broadcast(msg):
         """Send to every connected client. Devices in voice mode also get FRIDAY's words as speech."""
         audio = None
-        if msg.get("type") in ("say", "notify") and state.voice_clients:
+        if msg.get("type") in ("say", "say_part", "notify") and not msg.get("spoken") and state.voice_clients:
             try:
                 audio = base64.b64encode(await asyncio.to_thread(state.voice.speak, msg["text"])).decode()
             except Exception:
@@ -64,6 +67,7 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     async def say(kind, text, about=()):
         """about: the learnable kinds this line is made of; the owner's answer tunes them."""
         state.memory.log_notification(kind, text)
+        state.brain.said(text)  # so "it went great" answers the check-in FRIDAY just asked
         if about:
             state.last_said = (set(about), time.time())
         state.addressee.spoke()  # open the follow-up window so "stop telling me that" is heard
@@ -125,7 +129,6 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
         if q and quiet and now - state.memory.last_asked() > 20 * 3600 and state.memory.taste("question") >= INTERRUPT:
             state.memory.mark_asked(q["id"], now)
             state.pending_question = (q["id"], now)
-            state.brain.said(q["text"])
             await say("question", q["text"], about=["question"])
             return q["text"]
 
@@ -133,7 +136,7 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     state.pending_question, state.last_owner = None, 0.0
     state.notify, state.ask_question, state.quiet_hours = notify, ask_question, quiet_hours
     registry = tools.build(state)
-    state.plugins, state.plugin_errors = plugins.load(s.plugins_dir, state, registry)
+    state.plugins, state.plugin_errors = plugins.load(s.plugin_roots, state, registry)
     state.brain = Brain(state.llm, state.memory, registry, s.owner, skills=state.skills)
 
     async def hear(text, speaker="unknown", others_present=None):
@@ -165,13 +168,44 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
         if state.pending_question and time.time() - state.pending_question[1] < ANSWER_S:
             state.memory.answer(state.pending_question[0], cleaned)
         state.pending_question = None
-        reply = await state.brain.respond(cleaned, situation=situation())
-        state.memory.add_utterance(reply, speaker="friday", addressed=True)
-        state.addressee.spoke()
-        await broadcast({"type": "say", "text": reply})
+        reply = await respond_aloud(cleaned)
         await broadcast({"type": "memory", "facts": state.memory.profile()})
         catch_up = None if busy() else await brief()  # the owner is engaged anyway: a good moment
         return reply, catch_up
+
+    async def respond_aloud(prompt):
+        """Ask the brain and speak the answer sentence by sentence as it's written."""
+        state.hush, pending, spoken = False, [""], [0]
+
+        async def on_text(chunk):
+            # Speak each sentence the moment it's complete: FRIDAY starts talking while Claude still writes.
+            pending[0] += chunk
+            while (m := SENTENCE_END.search(pending[0])):
+                await say_part(pending[0][:m.end()].strip())
+                pending[0] = pending[0][m.end():]
+
+        async def say_part(text):
+            if text and not state.hush:
+                spoken[0] += 1
+                await broadcast({"type": "say_part", "text": text})
+
+        reply = await state.brain.respond(prompt, situation=situation(), on_text=on_text)
+        await say_part(pending[0].strip())
+        state.memory.add_utterance(reply, speaker="friday", addressed=True)
+        state.addressee.spoke()
+        await broadcast({"type": "say", "text": reply, "spoken": spoken[0] > 0})
+        return reply
+
+    async def greet():
+        """Headphones on after a while away: FRIDAY says hello, then delivers anything it held."""
+        away = time.time() - state.last_owner
+        state.last_owner = time.time()
+        when = "for the first time" if away > 30 * 86400 else f"after about {round(away / 3600)} hours away"
+        await respond_aloud(f"(Note from your senses, not said by {s.owner}: they just put their headphones on "
+                            f"{when}. Greet them in one short line, like a friend who's glad they're back; "
+                            "make it personal if you know something that fits. Don't list errands: anything "
+                            "waiting is delivered right after you.)")
+        await brief()
 
     def auth(request: Request):
         given = request.headers.get("authorization", "").removeprefix("Bearer ")
@@ -181,12 +215,35 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     @asynccontextmanager
     async def lifespan(_):
         task = asyncio.create_task(proactive.run(state)) if background else None
+        if background:
+            warm = asyncio.create_task(asyncio.to_thread(state.voice.warm))
+            state.tasks.add(warm)
+            warm.add_done_callback(state.tasks.discard)
         yield
         if task:
             task.cancel()
 
     app = FastAPI(title="FRIDAY", lifespan=lifespan)
     app.state.friday = state
+
+    async def typed(text):
+        state.memory.add_utterance(text, speaker="owner", addressed=True)
+        await broadcast({"type": "heard", "text": text, "addressed": True})
+        await converse(text)
+
+    async def spoken_in(pcm, speaker):
+        text = await asyncio.to_thread(state.voice.transcribe, pcm)
+        if text:
+            await hear(text, speaker)
+
+    def turn(coro):
+        """Run a turn in the background, one at a time, so the socket stays free for "interrupt"."""
+        async def run():
+            async with state.turn_lock:
+                await coro
+        t = asyncio.create_task(run())
+        state.tasks.add(t)
+        t.add_done_callback(state.tasks.discard)
 
     @app.websocket("/ws")
     async def ws(socket: WebSocket):
@@ -204,17 +261,19 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
                         await presence_update(msg)
                     except (KeyError, TypeError, ValueError):
                         pass  # a garbled sensor message shouldn't drop the connection
+                elif msg.get("type") == "interrupt":  # you talked over FRIDAY: stop speaking now
+                    state.hush = True
                 elif msg.get("type") == "utterance" and msg.get("text", "").strip():
-                    await hear(msg["text"], msg.get("speaker", "unknown"), msg.get("others_present"))
+                    turn(hear(msg["text"], msg.get("speaker", "unknown"), msg.get("others_present")))
                 elif msg.get("type") == "ask" and str(msg.get("text", "")).strip():  # typed: always for FRIDAY
-                    text = str(msg["text"]).strip()
-                    state.memory.add_utterance(text, speaker="owner", addressed=True)
-                    await broadcast({"type": "heard", "text": text, "addressed": True})
-                    await converse(text)
+                    turn(typed(str(msg["text"]).strip()))
                 elif msg.get("type") == "hello" and msg.get("voice"):
                     ok = await asyncio.to_thread(state.voice.available)
                     if ok:
                         state.voice_clients.add(socket)
+                        if s.greet_after_h and time.time() - state.last_owner > s.greet_after_h * 3600 \
+                                and not quiet_hours():
+                            turn(greet())
                     await socket.send_json({"type": "ready", "voice": ok, **({} if ok else {
                         "why": "this server has no speech models (run the Docker image)"})})
                 elif msg.get("type") == "audio" and socket in state.voice_clients:
@@ -222,9 +281,7 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
                         pcm = base64.b64decode(msg["pcm"], validate=True)
                     except (KeyError, TypeError, ValueError):
                         continue  # garbled audio shouldn't drop the connection
-                    text = await asyncio.to_thread(state.voice.transcribe, pcm)
-                    if text:
-                        await hear(text, msg.get("speaker", "unknown"))
+                    turn(spoken_in(pcm, msg.get("speaker", "unknown")))
         except WebSocketDisconnect:
             pass
         finally:

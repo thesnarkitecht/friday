@@ -36,15 +36,24 @@ class Claude:
             self._client = anthropic.AsyncAnthropic()
         return self._client
 
-    async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000):
-        """One Messages API call. Returns text, tool uses, and the raw content to append back unchanged."""
-        kwargs = {"tools": list(tools)} if tools else {}
-        r = await _call(lambda: self.client.beta.messages.create(
+    async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000, on_text=None):
+        """One Messages API call. Returns text, tool uses, and the raw content to append back unchanged.
+        With on_text, the reply streams: on_text(chunk) is awaited as words arrive, so FRIDAY can start
+        speaking the first sentence while Claude is still writing the rest."""
+        kwargs = dict(
             model=self.model, max_tokens=max_tokens, system=system, messages=messages,
             output_config={"effort": effort},
             cache_control={"type": "ephemeral"},  # system + tools + history are a stable prefix
             betas=[FALLBACK_BETA], fallbacks="default",  # a declined request is re-run server-side
-            **kwargs))
+            **({"tools": list(tools)} if tools else {}))
+
+        async def streamed():
+            async with self.client.beta.messages.stream(**kwargs) as stream:
+                async for chunk in stream.text_stream:
+                    await on_text(chunk)
+                return await stream.get_final_message()
+
+        r = await _call(streamed if on_text else lambda: self.client.beta.messages.create(**kwargs))
         return {
             "stop": r.stop_reason, "content": r.content,
             "text": "".join(b.text for b in r.content if b.type == "text").strip(),
