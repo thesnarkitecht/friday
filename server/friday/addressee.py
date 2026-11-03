@@ -2,11 +2,19 @@
 import re
 import time
 
+from pydantic import BaseModel
+
+from .llm import Unavailable
+
 _WAKE = re.compile(r"\b(?:hey|ok|okay|yo)?[\s,]*friday\b[\s,.!?]*", re.I)
 # "see you friday", "this friday night" mean the weekday, not the assistant.
 _WEEKDAY = re.compile(
     r"\b(on|this|next|last|by|until|till|every|since|before|after|from)\s+friday\b"
     r"|\bfriday(?:'s|s)?\s+(night|morning|afternoon|evening|at|is|was)\b", re.I)
+
+
+class Addressed(BaseModel):
+    addressed: bool
 
 
 class Addressee:
@@ -29,8 +37,13 @@ class Addressee:
         return "no", text
 
     @staticmethod
-    async def ask_model(llm, text, context, model=None):
+    async def ask_model(llm, text, context):
         prompt = ("A voice assistant named FRIDAY just finished speaking. Recent conversation:\n"
                   f"{context}\n\nNew utterance: \"{text}\"\n"
-                  "Is the new utterance addressed to FRIDAY (not to another person in the room)? Answer yes or no.")
-        return (await llm.text(prompt, model=model, max_tokens=3)).strip().lower().startswith("y")
+                  "Is the new utterance addressed to FRIDAY (not to another person in the room)?")
+        try:
+            verdict = await llm.decide(prompt, Addressed)
+        except Unavailable:
+            return False  # can't ask: stay quiet rather than butt in
+
+        return bool(verdict and verdict.addressed)

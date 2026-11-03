@@ -5,7 +5,7 @@ import sqlite3
 import time
 from datetime import datetime
 
-from .llm import parse_json
+from pydantic import BaseModel
 
 SCHEMA = """
 create table if not exists utterances(id integer primary key, ts real, speaker text, text text,
@@ -21,6 +21,7 @@ create table if not exists seen(key text primary key, ts real);
 create table if not exists notifications(id integer primary key, ts real, kind text, text text);
 create table if not exists taste(kind text primary key, score real);
 create table if not exists routines(id integer primary key, at text, days text, task text, last_day text);
+create table if not exists questions(id integer primary key, text text unique, asked real, answer text);
 create table if not exists held(id integer primary key, ts real, kind text, text text);
 """
 
@@ -49,12 +50,38 @@ def importance(text):
 
 
 CONSOLIDATE = (
-    "You are the memory of a personal assistant. Below is part of today's raw transcript. "
-    "Return ONLY JSON: {\"summary\": \"2-4 sentence account\", "
-    "\"facts\": [{\"text\": \"durable fact about the owner or people in their life\", "
-    "\"category\": \"person|preference|health|work|place|commitment|other\", \"importance\": 0.0-1.0}], "
-    "\"reminders\": [{\"text\": \"...\", \"due\": \"ISO-8601 local datetime\"}]}. "
-    "Only include facts still useful in a month. Skip small talk.\n\n")
+    "You are the memory of a personal assistant. Below is part of today's raw transcript. Summarize it in "
+    "2-4 sentences, pull out durable facts about the owner still useful in a month (interests, preferences, "
+    "work, places, commitments; skip small talk and other people's private matters), and any reminders with "
+    "an ISO-8601 local due time.\n\n")
+
+
+class Fact(BaseModel):
+    text: str
+    category: str  # interest | preference | work | place | commitment | other
+    importance: float
+
+
+class Reminder(BaseModel):
+    text: str
+    due: str
+
+
+class Digest(BaseModel):
+    summary: str
+    facts: list[Fact]
+    reminders: list[Reminder]
+
+
+QUESTIONS = (
+    "You help a voice assistant get to know its owner's tastes. Here is what it knows and the questions it has "
+    "already asked. Write 3 short, friendly new questions about preferences only (news topics, tech, hobbies, "
+    "how they like answers, routines, food, music). Never ask about relationships, family, friends, health, "
+    "money, religion or politics. Don't repeat anything already asked.\n\n")
+
+
+class Questions(BaseModel):
+    questions: list[str]
 
 
 def _chunks(lines, size):
@@ -67,6 +94,21 @@ def _chunks(lines, size):
     if chunk:
         yield chunk
 
+
+# Questions FRIDAY asks are about tastes, never people or private matters.
+_PERSONAL = re.compile(r"\b(wife|husband|partner|girlfriend|boyfriend|dating|relationship|married|divorce|family|"
+                       r"kids?|children|son|daughter|mom|mother|dad|father|parents?|sibling|brother|sister|friends?|"
+                       r"ex|love life|health|medical|weight|salary|income|money|debt|religio\w*|politic\w*)\b", re.I)
+
+SEED_QUESTIONS = [
+    "What news are you most interested in?",
+    "Which topics should I watch Hacker News for?",
+    "Which AI labs or models do you want to hear about first when something new drops?",
+    "Are you more of a short-answer or a full-explanation person when you ask me something?",
+    "What time of day do you least want to be interrupted?",
+    "What kind of music do you like to work to?",
+    "Which programming languages and tools do you use most these days?",
+]
 
 _DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -106,6 +148,18 @@ class Memory:
         if cur.rowcount:
             self.db.execute("insert into facts_fts(rowid, text) values(?, ?)", (cur.lastrowid, text.strip()))
         self.db.commit()
+
+    def forget(self, text):
+        """Delete facts containing text. Returns what was forgotten."""
+        rows = self.db.execute("select id, text from facts where text like ?", (f"%{text.strip()}%",)).fetchall()
+        for r in rows:
+            self.db.execute("delete from facts where id = ?", (r["id"],))
+            self.db.execute("delete from facts_fts where rowid = ?", (r["id"],))
+        self.db.commit()
+        return [r["text"] for r in rows]
+
+    def interests(self):
+        return [r["text"] for r in self.db.execute("select text from facts where category = 'interest'")]
 
     def profile(self, n=25):
         rows = self.db.execute("select category, text from facts order by importance desc, ts desc limit ?", (n,))
@@ -191,6 +245,47 @@ class Memory:
         self.db.commit()
         return due
 
+    # --- getting to know the owner: preference questions, one at a time ------
+    def add_questions(self, texts):
+        for t in texts:
+            if t.strip() and not _PERSONAL.search(t):  # preferences only, never relationships
+                self.db.execute("insert or ignore into questions(text) values(?)", (t.strip(),))
+        self.db.commit()
+
+    def next_question(self):
+        row = self.db.execute("select id, text from questions where asked is null order by id limit 1").fetchone()
+        return dict(row) if row else None
+
+    def last_asked(self):
+        return self.db.execute("select max(asked) from questions").fetchone()[0] or 0
+
+    def mark_asked(self, qid, now=None):
+        self.db.execute("update questions set asked = ? where id = ?", (now or time.time(), qid))
+        self.db.commit()
+
+    def answer(self, qid, text):
+        q = self.db.execute("select text from questions where id = ?", (qid,)).fetchone()
+        self.db.execute("update questions set answer = ? where id = ?", (text, qid))
+        self.db.commit()
+        if q:
+            self.remember(f"Asked \"{q['text']}\" they said: {text}", "preference", 0.8, "question")
+
+    def unanswered(self):
+        return self.db.execute("select count(*) from questions where asked is null").fetchone()[0]
+
+    async def think_of_questions(self, llm):
+        """Nightly: top up the question queue so FRIDAY keeps learning the owner's tastes."""
+        if self.unanswered() >= 3:
+            return []
+        known = "\n".join(self.profile(15)) or "(nothing yet)"
+        asked = "\n".join(self.asked_questions()) or "(none)"
+        out = await llm.decide(f"{QUESTIONS}Known:\n{known}\n\nAlready asked:\n{asked}", Questions)
+        self.add_questions(out.questions if out else [])
+        return out.questions if out else []
+
+    def asked_questions(self):
+        return [r["text"] for r in self.db.execute("select text from questions")]
+
     # --- the learning loop: how much the owner wants each kind of interruption --------
     def taste(self, kind):
         row = self.db.execute("select score from taste where kind = ?", (kind,)).fetchone()
@@ -217,7 +312,7 @@ class Memory:
         return [(r["kind"], r["text"]) for r in rows]
 
     # --- the nightly "sleep" pass ------------------------------------------
-    async def consolidate(self, llm, model=None, now=None, chunk_chars=6000):
+    async def consolidate(self, llm, now=None, chunk_chars=6000):
         now = now or time.time()
         rows = self.db.execute("select * from utterances where consolidated = 0 and ts < ? order by ts",
                                (now,)).fetchall()
@@ -228,15 +323,16 @@ class Memory:
                  for r in rows]
         data = {"summary": "", "facts": [], "reminders": []}
         for chunk in _chunks(lines, chunk_chars):  # small context windows: digest the day in bites
-            part = parse_json(await llm.text(CONSOLIDATE + chunk, model=model, max_tokens=1000)) or {}
-            data["summary"] = " ".join(x for x in (data["summary"], part.get("summary") or "") if x)
-            data["facts"] += part.get("facts") or []
-            data["reminders"] += part.get("reminders") or []
+            part = await llm.decide(CONSOLIDATE + chunk, Digest, effort="medium")
+            if part:
+                data["summary"] = " ".join(x for x in (data["summary"], part.summary) if x)
+                data["facts"] += [f.model_dump() for f in part.facts]
+                data["reminders"] += [r.model_dump() for r in part.reminders]
         if data["summary"]:
             self.db.execute("insert or replace into episodes values(?, coalesce((select summary from episodes "
                             "where day = ?) || ' ', '') || ?)", (day, day, data["summary"]))
         for f in data["facts"]:
-            if isinstance(f, dict) and f.get("text"):
+            if f.get("text"):
                 self.remember(f["text"], f.get("category", "other"), float(f.get("importance", 0.6)), "consolidated")
         for r in data["reminders"]:
             try:

@@ -1,43 +1,128 @@
-# FRIDAY guide: hardware, presence, and how it learns
+# FRIDAY guide: setup, earbuds, plugins, and how it decides to speak
 
-FRIDAY is now just the engine: memory, the agent loop, the proactive loop, presence and the learning loop.
-Anything that can send text and play speech is a client (see "Talking to it" below).
-
-## Shopping list
-
-Prices are approximate. Check before buying.
-
-### The pocket unit
+## What you need
 
 | Item | Why | Cost |
 |---|---|---|
-| Raspberry Pi 5, 8 GB (16 GB if you want a 4B model plus headroom) | Runs the engine and a small model | about $80 / $120 |
-| Official Active Cooler | A Pi 5 doing inference in a pocket throttles without it | about $5 |
-| Slim case that fits the cooler | Pocket | about $10 |
-| 64 GB+ A2 microSD, or an NVMe HAT + small SSD | Model files load much faster from NVMe | $12–40 |
-| USB-C power bank, 20,000 mAh, 5 V / 3 A output | 5–8 h of mixed use; the Pi 5 draws 8–10 W while generating | about $40 |
-| USB-C lavalier mic, or a small USB speakerphone | Ears | $15–60 |
-| Bluetooth earbuds | Voice | — |
-| *Optional:* Raspberry Pi AI HAT+ 2 (Hailo-10H, 8 GB on board) | Moves a 1–1.5B model off the CPU. Check its current model list first | about $130 |
+| A Linux box that's always on: a Raspberry Pi 5 (8 GB), a mini PC, or your home server | Runs the container. Whisper `base.en` transcribes comfortably on a Pi 5; use `tiny.en` if it lags | about $80+ |
+| Bluetooth earbuds with a mic | Ears and voice. Any pair that works as a headset | — |
+| A Claude sign-in or API key | The brain | API usage |
+| *Optional:* room radars (below) | Lets FRIDAY know when you have company at home | about $20/room |
+| *Optional:* Hermes Agent running somewhere | Heavy research and coding | free (MIT) |
 
-What runs on a Pi 5: a 1.5B–4B instruct model with tool calling (Qwen3-4B or Llama 3.2 3B, Q4) under
-`llama-server`. Expect a few words per second out and tens of tokens per second in. That's why prompt
-size matters so much (next section). Or keep the Blackhole box at home as the brain: point
-`FRIDAY_LLM_BASE_URL` at it over Tailscale and the Pi only runs the engine.
+Bluetooth reaches about 10 m, so FRIDAY hears you around the house, not across town. To take it with you,
+run the same container on a Pi 5 in your pocket (official Active Cooler plus a 20,000 mAh 5 V/3 A power bank).
 
-### Presence sensing (one per room)
+## Setup
+
+### 1. Pair the earbuds with the host
+
+```bash
+bluetoothctl
+```
+
+Then, inside `bluetoothctl`: `power on`, `scan on`, `pair <MAC>`, `trust <MAC>`, `connect <MAC>`.
+
+Switch them to the headset profile, which turns the mic on. A2DP is music-only and has no mic:
+
+```bash
+pactl list cards short
+```
+
+```bash
+pactl set-card-profile bluez_card.<MAC_with_underscores> headset-head-unit
+```
+
+Make them the default input and output (`pactl set-default-source …` / `pactl set-default-sink …`), or use
+your desktop's sound settings. FRIDAY uses whatever the defaults are.
+
+Headset mode is lower-fidelity audio (mSBC, 16 kHz), which is fine for speech and exactly the rate Whisper wants.
+
+### 2. Credentials
+
+```bash
+cp .env.example .env
+```
+
+Set `FRIDAY_TOKEN` (long and random), `FRIDAY_OWNER_NAME`, and any plugin settings. For Claude, either:
+- **Sign in:** install the `ant` CLI on the host and run `ant auth login`. Compose mounts that profile into
+  the container read-only, and the Anthropic SDK picks it up.
+- **API key:** set `ANTHROPIC_API_KEY` in `.env`.
+
+A Claude Pro/Max chat subscription can't power a third-party server like this; it bills as API usage.
+
+### 3. Start
+
+```bash
+docker compose up -d --build
+```
+
+```bash
+docker compose logs -f
+```
+
+The compose file mounts `/run/user/1000/pulse` for audio. If your user ID isn't 1000 (`id -u`), change
+both paths in `docker-compose.yml`.
+
+### 4. Check it
+
+```bash
+curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"text":"What do you know about me?"}' localhost:8080/api/ask
+```
+
+`GET /api/hud` shows loaded plugins (and any that failed), the situation FRIDAY sees, learned
+interruption scores, and recent speech.
+
+## How FRIDAY decides to speak
+
+- **Always, right away:** reminders you set, routines you scheduled, Hermes reporting back.
+- **Everything else** (new models, Hacker News, any plugin feed) goes through two checks:
+  1. **Company.** If room radars count more than one person, or another voice was heard in the last
+     2 minutes, it waits. When company leaves, you get one line: "Catching you up: …".
+  2. **What it has learned.** Push back within 90 seconds ("not now", "I know", "stop") and that kind
+     of alert scores lower; engage and it scores higher. Below 0.4 it stops interrupting and waits for
+     the next good moment: the next time you talk to FRIDAY, or company leaving.
+- **Feeds start quietly.** The first time a feed runs it only learns what already exists. After that,
+  each new item is announced once, at most 3 per check.
+- **Questions about you:** at most one every 20 hours, between 10:00 and 21:00, only when you've talked to
+  FRIDAY in the last half hour but not in the last 5 minutes. Questions are about preferences only. Your
+  answer is kept as a preference, and topics you name become interests for Hacker News. Push back on
+  questions and it asks less.
+
+## What it keeps
+
+- **Raw speech:** deleted after the nightly pass (3:00) unless it scored as worth keeping (commitments,
+  dates, preferences). Other people's words are always deleted then. Audio is never stored.
+- **Facts about you:** kept, shown in `/api/memory`. Say "Friday, forget that I …" to delete one.
+- **Skills:** `data/skills/`, plain Markdown you can read and edit.
+
+## Plugins
+
+Built in:
+
+| Plugin | What it does | Setting |
+|---|---|---|
+| `models` | Every 10 min: new model ids on OpenRouter's public list from the labs you choose | `FRIDAY_MODEL_LABS` |
+| `hackernews` | Every 10 min: front-page stories matching your interests. Also a search tool | — |
+| `hermes` | `ask_hermes` hands research or coding to Hermes Agent and reports back | `HERMES_URL`, `HERMES_KEY` |
+
+To connect Hermes, turn on its API server (`API_SERVER_ENABLED=true`, `API_SERVER_KEY=…` in Hermes'
+`.env`, then `hermes gateway`). Then set `HERMES_URL=http://<host>:8642/v1` and `HERMES_KEY` to the same key.
+
+Writing one: make `server/plugins/<name>/plugin.py` with `def setup(p):`. Use `@p.tool(...)` for things
+Claude can call, `@p.feed(every_s=...)` for zero-token checks returning `{"key", "kind", "text"}` items,
+`p.env("NAME")` for credentials, and an optional `skills/` folder. The plugins folder is mounted, so a
+restart picks up changes without rebuilding.
+
+## Room radars (optional)
 
 | Item | Why | Cost |
 |---|---|---|
-| HLK-LD2450 24 GHz mmWave radar | Counts up to 3 people in the room, through clothes and in the dark. No camera | about $15 |
-| Seeed XIAO ESP32-C3 (or any ESP32 board) | Runs ESPHome and tells FRIDAY the count | about $5 |
-| USB-C phone charger + cable | Power | — |
-| *Optional:* HLK-LD2410C | The LD2450 can lose someone who sits perfectly still; the LD2410C catches still presence | about $5 |
+| HLK-LD2450 24 GHz mmWave radar | Counts up to 3 people in a room. No camera | about $15 |
+| Seeed XIAO ESP32-C3 | Runs ESPHome and reports the count | about $5 |
+| *Optional:* HLK-LD2410C | Catches someone sitting perfectly still, which the LD2450 can miss | about $5 |
 
-Start with one in the room you spend the most time in. Four wires: 5V, GND, TX→RX, RX→TX.
-
-ESPHome config, so the sensor reports changes to FRIDAY (check field names against the ESPHome
-`ld2450` and `http_request` docs for your version):
+ESPHome config (check field names against the ESPHome `ld2450` and `http_request` docs for your version):
 
 ```yaml
 uart:
@@ -61,89 +146,15 @@ sensor:
               people: !lambda 'return to_string((int) x);'
 ```
 
-### Who's around you (anywhere, not just at home)
-
-The question FRIDAY needs answered is "did the owner say that, and was anyone else talking?" Voice
-answers it better than any body-worn sensor. Radar on your body sees your own limbs move, not people.
-
-| Item | Why | Cost |
-|---|---|---|
-| The lavalier mic from the pocket kit | Your voice is much louder on it than anyone else's | — |
-| Voice ID on the Pi ([sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) speaker identification) | Enroll 30 s of your voice. Each utterance is tagged `owner` or `other` | free, runs offline |
-| *Optional:* throat mic, plus a 2-input USB audio adapter | It hears only you, even in a loud bar. Speech on the room mic but not the throat mic is someone else | about $25 + $15 |
-
-The client sends that tag as `speaker` with each utterance. The engine then:
-- never takes commands from another voice, even if a guest says "Friday";
-- counts you as "with company" for 2 minutes after another voice. Follow-ups without the wake word go
-  to the model to decide, and non-urgent interruptions wait;
-- forgets other people's words after the nightly pass, as before.
-
-### Optional
-
-| Item | Why | Cost |
-|---|---|---|
-| Tailscale | Pocket unit reaches the home box from anywhere | free personal plan |
-| Twilio number + usage | Calls FRIDAY makes for you | about $1–2/month, 1–2¢/min |
-
-## Why big prompts were killing local models, and what changed
-
-Prompt processing is the slow part on small hardware. The old prompt put the clock and the recalled
-memories inside the system prompt, so every turn started from token zero. With the tool list, that
-was 2,000+ tokens re-read on every question.
-
-Now:
-- The system prompt and the tool list never change. `llama-server` and vLLM keep that prefix in the
-  KV cache, so a new turn only processes the new message.
-- The per-turn part (time, place, situation, 8 facts, 4 memories, each capped at 160 characters) goes
-  in a small `[context]` block on the latest message only. Earlier turns stay as plain text, so they
-  stay cached too.
-- History is 12 messages, and tool results are capped at 3,000 characters.
-- The nightly memory pass digests the day in ~6,000-character pieces, so it fits a 4k context window.
-
-Run `llama-server` with `--jinja` (tool calling) and `-c 4096` or more. Prompt caching is on by default.
-
-## How FRIDAY decides when to speak up
-
-- **Always, right away:** reminders you set, severe weather, nearby quakes, results of calls it made.
-- **Everything else** (GitHub today, any feed you add later) goes through two checks:
-  1. **Company.** If the presence sensors count more than one person, it waits. When they leave, you
-     get one line: "Catching you up: …".
-  2. **What it has learned.** When you push back within 90 seconds of an interruption ("stop", "not now",
-     "I know", "who cares"…), that kind of interruption scores lower. When you engage, it scores higher.
-     Below 0.4, that kind stops interrupting and waits for the next good moment instead: the next time
-     you talk to FRIDAY, or company leaving. Your reaction to a catch-up line tunes every kind in it, so
-     a kind you start caring about again works its way back to interrupting.
-
-`GET /api/hud` shows the presence count, the situation FRIDAY sees, and the learned scores.
-
-## Run it
-
-```bash
-cd server
-pip install -r requirements.txt
-cp .env.example .env   # fill it in
-set -a; . ./.env; set +a
-uvicorn friday.app:app --host 0.0.0.0 --port 8080
-```
-
-Check it:
-```bash
-curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"text":"What do you know about me?"}' localhost:8080/api/ask
-```
-
-Fake a sensor:
-```bash
-curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"room":"office","people":2}' localhost:8080/api/presence
-```
-
-## Talking to it
+## API
 
 | Endpoint | Use |
 |---|---|
 | `WS /ws?token=…` | Send `{"type":"utterance","text":…}` or `{"type":"presence","room":…,"people":…}`. Receive `heard`, `say`, `notify`, `memory` |
-| `POST /api/utterance` | Everything you hear. FRIDAY decides whether it was addressed |
+| `POST /api/utterance` | Everything heard; FRIDAY decides whether it was addressed |
 | `POST /api/ask` | Push-to-talk: always addressed |
-| `POST /api/presence` | Room sensors |
-| `GET /api/hud` | State, recent speech, notifications, learned scores |
+| `POST /api/presence` | Room radars |
+| `GET /api/hud` | Plugins, situation, learned scores, recent speech |
+| `GET /api/memory?q=` | What FRIDAY knows about you |
 
-Not built yet: the Pi's own voice loop (whisper.cpp in, voice ID tag, Piper out, talking to `/ws`).
+Keep port 8080 on your LAN or Tailscale. It holds your life.

@@ -1,42 +1,42 @@
-"""FRIDAY home server. Run: uvicorn friday.app:app --host 0.0.0.0 --port 8080"""
+"""FRIDAY server. Run: uvicorn friday.app:app --host 0.0.0.0 --port 8080"""
 import asyncio
 import hmac
 import re
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import parse_qsl
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
 
-from . import config, proactive, tools
+from . import config, plugins, proactive, tools
 from .addressee import Addressee
 from .brain import Brain
-from .calls import Calls
-from .feeds import Feeds
-from .llm import LLM
-from .memory import Memory
+from .llm import Claude
+from .memory import SEED_QUESTIONS, Memory
 from .skills import Skills
 
 
 # Kinds that interrupt no matter what: the owner asked for them, or they're about safety.
-URGENT = {"reminder", "alert", "call", "error", "routine"}
+URGENT = {"reminder", "error", "routine"}
 INTERRUPT, FEEDBACK_S = 0.4, 90  # below INTERRUPT a kind waits for the next good moment
 VOICE_COMPANY_S = 120  # someone else spoke this recently: you're probably talking with them
+ANSWER_S = 120  # a reply this soon after FRIDAY asks a question is the answer
 PUSHBACK = re.compile(r"\b(stop|enough|shut up|quiet|not now|later|don'?t care|who cares|not interested|"
                       r"don'?t (tell|need|want)|i know|whatever|no one asked|annoying)\b", re.I)
 
 
-def create_app(settings=None, llm=None, feeds=None, background=True):
+def create_app(settings=None, llm=None, background=True, http=None):
     s = settings or config.load()
     if not s.token:
         raise RuntimeError("Set FRIDAY_TOKEN: the server holds your life, it doesn't run unauthenticated.")
-    state = SimpleNamespace(settings=s, location=None, clients=set())
-    state.llm = llm or LLM(s.llm_base, s.llm_key, s.llm_model)
+    state = SimpleNamespace(settings=s, clients=set())
+    state.llm = llm or Claude(s.model)
+    state.http = http or httpx.AsyncClient(timeout=20, headers={"User-Agent": "friday-assistant"})
     state.memory = Memory(s.db, s.retain_days, s.keep_importance, s.record_others)
-    state.skills = Skills(s.skills_dir)
-    state.feeds = feeds or Feeds(s.github_token)
+    state.memory.add_questions(SEED_QUESTIONS)
+    state.skills = Skills(s.skills_dir, extra=sorted(Path(s.plugins_dir).glob("*/skills")))
     state.addressee = Addressee()
 
     async def broadcast(msg):
@@ -55,10 +55,10 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
         state.addressee.spoke()  # open the follow-up window so "stop telling me that" is heard
         await broadcast({"type": "notify", "kind": kind, "text": text})
 
-    async def notify(kind, text):
+    async def notify(kind, text, urgent=False):
         """Speak now or hold for a better moment: urgent kinds always speak; the rest wait while
         the owner has company, and wait for good if the learning loop says they don't want them live."""
-        if kind in URGENT:
+        if urgent or kind in URGENT:
             await say(kind, text)
         elif busy() or state.memory.taste(kind) < INTERRUPT:
             state.memory.hold(kind, text)
@@ -94,10 +94,26 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
         company = sum(p.values()) - 1
         return f"at home ({', '.join(rooms)})" + (f" with {company} other {'person' if company == 1 else 'people'}" if company else ", alone")
 
+    async def ask_question(now=None):
+        """Getting to know the owner: one preference question at a quiet moment, at most every 20 hours,
+        only while they're around (spoke in the last half hour) and learning says they don't mind."""
+        now = now or time.time()
+        q = state.memory.next_question()
+        # Around (spoke to FRIDAY in the last half hour) but not mid-conversation (nothing for 5 minutes).
+        quiet = not busy() and now - state.addressee.last_spoke > 300 and 300 < now - state.last_owner < 1800
+        if q and quiet and now - state.memory.last_asked() > 20 * 3600 and state.memory.taste("question") >= INTERRUPT:
+            state.memory.mark_asked(q["id"], now)
+            state.pending_question = (q["id"], now)
+            state.brain.said(q["text"])
+            await say("question", q["text"], about=["question"])
+            return q["text"]
+
     state.last_said, state.presence, state.other_voice = None, {}, 0.0  # presence: room -> people the sensors count
-    state.notify = notify
-    state.calls = Calls(s, state.llm, state.memory, notify)
-    state.brain = Brain(state.llm, state.memory, tools.build(state), s.owner, skills=state.skills)
+    state.pending_question, state.last_owner = None, 0.0
+    state.notify, state.ask_question = notify, ask_question
+    registry = tools.build(state)
+    state.plugins, state.plugin_errors = plugins.load(s.plugins_dir, state, registry)
+    state.brain = Brain(state.llm, state.memory, registry, s.owner, skills=state.skills)
 
     async def hear(text, speaker="unknown", others_present=None):
         """Every utterance is remembered; only ones meant for FRIDAY get a reply.
@@ -111,17 +127,19 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
             verdict = "no"  # only the owner commands FRIDAY, even if a guest says "Friday"
         if verdict == "maybe":
             context = "\n".join(f"{u['speaker']}: {u['text']}" for u in state.memory.recent(6))
-            verdict = "yes" if await Addressee.ask_model(state.llm, text, context, s.fast_model) else "no"
+            verdict = "yes" if await Addressee.ask_model(state.llm, text, context) else "no"
         addressed = verdict == "yes"
         state.memory.add_utterance(text, speaker="owner" if addressed and speaker == "unknown" else speaker,
                                    addressed=addressed)
         await broadcast({"type": "heard", "text": text, "addressed": addressed})
         if not addressed:
             return None
+        state.last_owner = time.time()
         learn_from(cleaned)
-        loc = state.location
-        reply = await state.brain.respond(cleaned, where=f"{loc['lat']:.4f},{loc['lon']:.4f}" if loc else "unknown",
-                                          situation=situation())
+        if state.pending_question and time.time() - state.pending_question[1] < ANSWER_S:
+            state.memory.answer(state.pending_question[0], cleaned)
+        state.pending_question = None
+        reply = await state.brain.respond(cleaned, situation=situation())
         state.memory.add_utterance(reply, speaker="friday", addressed=True)
         state.addressee.spoke()
         await broadcast({"type": "say", "text": reply})
@@ -156,9 +174,7 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
         try:
             while True:
                 msg = await socket.receive_json()
-                if msg.get("type") == "location":
-                    state.location = {"lat": float(msg["lat"]), "lon": float(msg["lon"]), "ts": time.time()}
-                elif msg.get("type") == "presence":
+                if msg.get("type") == "presence":
                     try:
                         await presence_update(msg)
                     except (KeyError, TypeError, ValueError):
@@ -195,18 +211,15 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
     async def ask(body: dict):
         """Push-to-talk / scripts entry point: always addressed, always the owner."""
         state.memory.add_utterance(body["text"], speaker="owner", addressed=True)
+        state.last_owner = time.time()
         reply = await state.brain.respond(body["text"], situation=situation())
         state.memory.add_utterance(reply, speaker="friday", addressed=True)
         return {"reply": reply}
 
-    @app.post("/api/location", dependencies=[Depends(auth)])
-    async def location(body: dict):
-        state.location = {"lat": float(body["lat"]), "lon": float(body["lon"]), "ts": time.time()}
-        return {"ok": True}
-
     @app.get("/api/hud", dependencies=[Depends(auth)])
     async def hud():
-        return {"location": state.location, "presence": state.presence, "situation": situation(),
+        return {"presence": state.presence, "situation": situation(), "plugins": [p.name for p in state.plugins],
+                "plugin_errors": state.plugin_errors,
                 "learned": state.memory.tastes(), "notifications": state.memory.notifications(),
                 "recent": state.memory.recent(20)}
 
@@ -216,15 +229,7 @@ def create_app(settings=None, llm=None, feeds=None, background=True):
 
     @app.post("/api/consolidate", dependencies=[Depends(auth)])
     async def consolidate():
-        return await state.memory.consolidate(state.llm, model=s.fast_model) or {}
-
-    @app.post("/twilio/turn")
-    async def twilio_turn(request: Request, call: str):
-        params = dict(parse_qsl((await request.body()).decode()))
-        if not state.calls.verify(state.calls.turn_url(call), params, request.headers.get("x-twilio-signature")):
-            raise HTTPException(403)
-        xml = await state.calls.turn(call, params.get("SpeechResult", ""))
-        return Response(xml, media_type="application/xml")
+        return await state.memory.consolidate(state.llm) or {}
 
     return app
 

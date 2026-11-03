@@ -1,74 +1,65 @@
 # FRIDAY
 
-A voice-first personal assistant that runs on your own hardware. It listens, remembers what matters,
-and speaks up on its own when something needs your attention.
+A proactive voice assistant that lives in your earbuds. It listens all day, keeps what matters and drops
+the rest, learns your tastes by asking, and speaks up when something you care about happens. It assists;
+it doesn't automate.
 
 ```
-clients (pocket Pi, room sensors, anything) ──(Tailscale, WebSocket/HTTP)──► engine ──► model server
-  speech as text, presence counts                memory (SQLite + full-text search)     llama.cpp on the Pi, or
-                                                 agent loop + tools                     Tenstorrent Blackhole at home
-                                                 proactive loop + learning loop
-                                                 Twilio calls on your behalf
+Bluetooth earbuds ──► ears (speech detection + Whisper, on your box) ──► FRIDAY server ──► Claude
+        ▲                                                                  │   │   │
+        └──────────── Piper voice ◄──── replies, alerts, questions ◄───────┘   │   └── plugins: new models,
+                                                                               │       Hacker News, Hermes…
+                                                       memory + skills (SQLite, SKILL.md)
 ```
+
+Everything runs in **one Docker container**: the server, the voice loop, every plugin, and every
+credential (one `.env` file). No MCP servers.
 
 ## What it does
 
-- **Hears everything you send it**, and knows when you're talking to it: the wake word ("Friday…", but not
-  "see you Friday"), a 10-second follow-up window after it speaks, and the model breaking ties when
-  presence sensors say other people are around.
-- **Remembers**: every utterance gets an importance score. At 3am a "sleep" pass turns the day into a
-  summary, durable facts about you, and reminders. Low-value raw text expires after `FRIDAY_RETAIN_DAYS`.
-  Words from anyone who isn't you are deleted after that pass unless `FRIDAY_RECORD_OTHERS=1`.
-- **Speaks up**: due reminders, severe NWS weather alerts, magnitude 4+ quakes within 200 km, and GitHub
-  review requests and mentions. Each one is said once.
-- **Reads the room**: mmWave sensors report how many people are in each room. Non-urgent things wait
-  while you have company and arrive as one catch-up line when they leave.
-- **Learns what's worth interrupting you for**: pushing back ("not now", "I know") or engaging tunes each
-  kind of interruption. Kinds you don't want live wait for the next good moment instead.
-- **Learns how to do things**: skills are `SKILL.md` how-tos (the Hermes Agent / agentskills.io format).
-  Only a one-line index sits in the prompt; the steps load when needed. Each night FRIDAY reviews what
-  it did with tools and writes or fixes skills.
-- **Routines**: "every weekday at 7, brief me." FRIDAY does the task on schedule and tells you.
-- **Small-model friendly**: the system prompt and tools never change between turns, so local servers
-  reuse their prompt cache; only a short context block is new each time.
-- **Calls people for you** through Twilio: it says it's an AI assistant, works toward the goal you gave it,
-  and reports back.
-- **Looks at public traffic cameras** (NYC, London, California) and describes them with a vision model.
+- **Hears you through paired Bluetooth earbuds.** Speech is transcribed on your machine. It answers when
+  you say "Friday…", for 10 seconds after it speaks, or when Claude decides an ambiguous line was meant
+  for it. Voices it's told aren't yours can never command it.
+- **Answers with Claude.** Sign in once with `ant auth login` (or use an API key). Quick decisions
+  (was that for me? what's worth remembering?) come back as type-checked structured output.
+- **Keeps what's needed, throws away the rest.** Every line gets an importance score. Each night it turns
+  the day into a summary, facts about you, and reminders, then deletes raw speech that didn't matter.
+  No audio is ever stored.
+- **Rebuilds micro skills every night.** It reviews what it did with tools that day and writes or fixes
+  small how-tos (`SKILL.md`, the Hermes Agent / agentskills.io format). Only a one-line index is in the
+  prompt; the steps load when needed.
+- **Gets to know you.** About once a day, at a quiet moment, it asks one question about your
+  preferences ("What news are you most interested in?"). It never asks about relationships, family,
+  health or money.
+- **Speaks up on its own, without spending tokens.** Plugins check sources with plain HTTP:
+  - **New models:** every 10 minutes it checks OpenRouter's public model list and tells you when a
+    major lab ships one.
+  - **Hacker News:** every 10 minutes it checks the front page for stories about your interests.
+- **Hands heavy work to Hermes Agent.** Research and coding go to Hermes over its OpenAI-compatible
+  API. FRIDAY tells you when the answer is back.
+- **Knows when to interrupt.** Reminders and things you asked for always speak. Everything else waits
+  while you have company, and learns from your reactions: say "not now" and that kind of alert starts
+  waiting for a good moment instead.
 
-## Run the server
+## Run it
 
 ```bash
-cd server
-pip install -r requirements.txt
-cp .env.example .env   # fill it in
-set -a; . ./.env; set +a
-uvicorn friday.app:app --host 0.0.0.0 --port 8080
+cp .env.example .env      # set FRIDAY_TOKEN, your name, and plugin credentials
+ant auth login            # Claude sign-in (or set ANTHROPIC_API_KEY in .env)
+docker compose up -d --build
 ```
 
-Tests: `cd server && python -m pytest -q`
+Pair your earbuds with the host first (see [docs/GUIDE.md](docs/GUIDE.md)). Tests:
+`cd server && pip install -r requirements.txt && python -m pytest -q`
 
-### Model server on the Blackhole cards
+## Plugins
 
-Run Tenstorrent's [tt-inference-server](https://github.com/tenstorrent/tt-inference-server) and point
-`FRIDAY_LLM_BASE_URL` at it. Check its model support table for what currently runs on Blackhole; the
-defaults in `.env.example` are placeholders. The model needs tool calling. Camera descriptions need a
-vision model. You can point either setting at another server, including a cloud one.
-
-### Reaching it from anywhere
-
-Put the pocket unit, the home box and the room sensors on [Tailscale](https://tailscale.com) (sensors can
-stay on the home LAN). Twilio has to reach `/twilio/turn` from the internet: expose only that path (e.g.
-Tailscale Funnel) and set `FRIDAY_PUBLIC_URL`. Twilio requests are checked against their signature.
-
-## Known limits
-
-- No voice loop on the Pi yet: speech must arrive as text (`/ws`, `/api/utterance`, `/api/ask`).
-- Voices aren't told apart: speech addressed to FRIDAY is treated as yours, everything else as "unknown".
-
-Skills and progressive disclosure are adapted from [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research (MIT).
-Traffic camera catalogs are ported from [bilawalsidhu/gods-eye-view](https://github.com/bilawalsidhu/gods-eye-view) (MIT).
+A plugin is a folder in `server/plugins/` with a `plugin.py`. It can add tools for Claude, zero-token feeds
+for the proactive loop, and skills. See `server/friday/plugins.py` for the whole interface, and
+`server/plugins/models/plugin.py` for a 30-line example. Credentials go in `.env`.
 
 **How it works:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (diagrams).
+**Setup, hardware and earbuds:** [docs/GUIDE.md](docs/GUIDE.md).
 
-**Start here:** [docs/GUIDE.md](docs/GUIDE.md) has the shopping list (pocket Pi and presence sensors),
-why prompts are shaped the way they are, and how the learning loop decides when to speak.
+Skills and progressive disclosure are adapted from [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+by Nous Research (MIT).

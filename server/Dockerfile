@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+# pulseaudio-utils: parec/paplay talk to the host's PipeWire (earbuds) through the mounted socket.
+RUN apt-get update && apt-get install -y --no-install-recommends pulseaudio-utils && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt requirements-voice.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-voice.txt
+# Piper voice baked in so the container needs no download at runtime.
+RUN mkdir -p /opt/voices && python -m piper.download_voices --data-dir /opt/voices en_US-lessac-medium
+COPY friday ./friday
+COPY plugins ./plugins
+COPY skills ./skills.seed
+COPY start.sh ./
+ENV FRIDAY_DB=/data/friday.db FRIDAY_SKILLS_DIR=/data/skills FRIDAY_PLUGINS_DIR=/app/plugins \
+    FRIDAY_PIPER_VOICE=/opt/voices/en_US-lessac-medium.onnx HF_HOME=/data/hf
+EXPOSE 8080
+CMD ["./start.sh"]

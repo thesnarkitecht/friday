@@ -3,33 +3,13 @@ import asyncio
 import time
 from datetime import datetime
 
-SEVERE = {"Extreme", "Severe"}
+from . import plugins
 
 
 async def tick(state, now=None):
-    """One pass: due reminders, new severe alerts, nearby quakes, new GitHub activity. Returns what was said."""
+    """One pass: due reminders, owner-scheduled routines, plugin feeds, maybe a question. Returns what was said."""
     now = now or time.time()
-    said = []
-    for text in state.memory.due_reminders(now):
-        said.append(("reminder", f"Reminder: {text}"))
-    lat = (state.location or {}).get("lat", state.settings.home_lat)
-    lon = (state.location or {}).get("lon", state.settings.home_lon)
-    if lat or lon:
-        try:
-            for a in await state.feeds.alerts(lat, lon):
-                if a["severity"] in SEVERE and state.memory.first_time(f"nws:{a['id']}"):
-                    said.append(("alert", a["headline"] or a["event"]))
-            for q in await state.feeds.quakes(lat, lon, radius_km=200):
-                if (q["mag"] or 0) >= 4 and state.memory.first_time(f"usgs:{q['id']}"):
-                    said.append(("alert", f"Magnitude {q['mag']} earthquake {q['km']} km away, {q['place']}."))
-        except Exception:
-            pass  # feeds flake; try again next tick
-    try:
-        for n in await state.feeds.github():
-            if n["reason"] in ("review_requested", "mention", "assign") and state.memory.first_time(f"gh:{n['id']}"):
-                said.append(("github", f"GitHub: {n['reason'].replace('_', ' ')} on {n['repo']}: {n['title']}"))
-    except Exception:
-        pass
+    said = [("reminder", f"Reminder: {text}") for text in state.memory.due_reminders(now)]
     for task in state.memory.due_routines(now):  # owner-scheduled: FRIDAY does the task, then says it
         try:
             said.append(("routine", await state.brain.respond(f"(Scheduled routine, nobody asked just now.) {task}")))
@@ -37,22 +17,31 @@ async def tick(state, now=None):
             said.append(("error", f"Routine '{task}' failed: {type(e).__name__}"))
     for kind, text in said:
         await state.notify(kind, text)
+    said += await plugins.poll(state.plugins, state.memory, state.notify, now)  # zero-token checks
+    if 10 <= datetime.fromtimestamp(now).hour < 21:
+        q = await state.ask_question(now)
+        if q:
+            said.append(("question", q))
     return said
 
 
-async def run(state, every_s=120):
+async def run(state, every_s=60):
     last_sleep_day = None
     while True:
-        await tick(state)
+        try:
+            await tick(state)
+        except Exception as e:  # one bad tick must not stop FRIDAY speaking up for good
+            await state.notify("error", f"Proactive check failed: {type(e).__name__}")
         today = datetime.now()
         if today.hour == 3 and last_sleep_day != today.date():  # the nightly "sleep" pass
             last_sleep_day = today.date()
             try:
-                await state.memory.consolidate(state.llm, model=state.settings.fast_model)
+                await state.memory.consolidate(state.llm)  # keep what matters, drop the rest
                 # The skill half of the learning loop: turn today's tool use into reusable how-tos.
                 worklog, state.brain.worklog = state.brain.worklog, []
-                await state.skills.review(state.llm, worklog, model=state.settings.fast_model)
+                await state.skills.review(state.llm, worklog)
+                await state.memory.think_of_questions(state.llm)
                 state.brain.refresh()  # the one daily moment the cached prompt prefix changes
             except Exception as e:
-                await state.notify("error", f"Nightly memory/skill pass failed: {e}")
+                await state.notify("error", f"Nightly memory/skill pass failed: {type(e).__name__}")
         await asyncio.sleep(every_s)

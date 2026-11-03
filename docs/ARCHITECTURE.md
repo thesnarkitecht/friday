@@ -1,103 +1,125 @@
 # How FRIDAY works
 
+Everything below runs in one Docker container.
+
 ## The whole agent
 
 ```mermaid
 flowchart TB
-    subgraph IN["Senses (clients)"]
-        mic["Pocket Pi mic<br/>speech → text + voice ID<br/>(owner / other)"]
-        radar["Room radars<br/>LD2450 → people per room"]
-        ptt["Push-to-talk / scripts<br/>/api/ask"]
+    subgraph EARS["Ears (friday/ears.py)"]
+        buds["Bluetooth earbuds<br/>headset mic"]
+        vad["Speech detection<br/>cuts utterances"]
+        stt["Whisper on your box<br/>speech → text"]
+        tts["Piper voice<br/>→ earbuds"]
     end
 
-    subgraph ENGINE["FRIDAY engine (server/friday)"]
-        hear["hear()<br/>remember every utterance"]
-        who{"Addressed to FRIDAY?<br/>wake word · follow-up window<br/>guest voice → never<br/>company → model breaks tie"}
-        presence["Presence + company<br/>sensors count · other voice in last 2 min"]
+    subgraph SERVER["FRIDAY server"]
+        hear["hear()<br/>score + remember every line"]
+        who{"Meant for FRIDAY?<br/>wake word · 10 s follow-up<br/>other voice → never<br/>with company → Claude decides (typed)"}
 
-        subgraph BRAIN["Brain: agent loop"]
-            prefix["Cached prefix (same every turn)<br/>persona + skill index + tool list"]
-            ctx["Per-turn [context]<br/>time · place · situation<br/>8 facts · 4 memories"]
-            llm(["LLM<br/>llama.cpp on the Pi or Blackhole box"])
-            tools["Tools<br/>remember · recall · reminders · routines<br/>skill_view · skill_save<br/>situation · cameras · github · calls"]
+        subgraph BRAIN["Brain"]
+            prefix["Cached prefix<br/>persona + skill index + tools"]
+            ctx["Per-turn [context]<br/>time · situation · 8 facts · 4 memories"]
+            claude(["Claude<br/>ant auth login / API key"])
+            tools["Tools<br/>remember · forget · recall · reminders<br/>routines · skill_view · skill_save<br/>+ plugin tools"]
         end
 
-        mem[("Memory (SQLite + FTS)<br/>utterances · facts · day summaries<br/>reminders · routines")]
-        skills[("Skills folder<br/>SKILL.md files")]
+        mem[("Memory (SQLite)<br/>facts · interests · day summaries<br/>reminders · routines · questions")]
+        skills[("Skills<br/>SKILL.md")]
 
-        subgraph PRO["Proactive loop (every 2 min)"]
-            feeds["Reminders · NWS alerts · quakes<br/>GitHub · routines"]
-            gate{"Speak now?<br/>urgent → yes<br/>with company → hold<br/>learned score below 0.4 → hold"}
-            held[("Held for later")]
+        subgraph PRO["Proactive loop (every minute)"]
+            due["Reminders · routines"]
+            feeds["Plugin feeds, plain HTTP, zero tokens<br/>new models (OpenRouter) · Hacker News"]
+            ask["One preference question a day<br/>at a quiet moment"]
+            gate{"Speak now?<br/>urgent → yes<br/>company → hold<br/>learned score below 0.4 → hold"}
+            held[("Held for a good moment")]
         end
 
-        subgraph NIGHT["Nightly sleep pass (3am)"]
-            consolidate["Consolidate the day<br/>summary · facts · reminders<br/>(in 6k-char chunks)"]
-            review["Skill review<br/>today's tool use → new or better skills"]
+        subgraph NIGHT["3am sleep pass (typed outputs)"]
+            keep["Keep what matters<br/>facts · summary · reminders<br/>delete the rest"]
+            review["Rebuild micro skills<br/>from today's tool use"]
+            newq["Think of new<br/>preference questions"]
         end
     end
 
-    out["Voice out<br/>Piper TTS / any client on /ws"]
-    owner(("Owner's reaction<br/>within 90 s"))
+    hermes(["Hermes Agent<br/>OpenAI-compatible API<br/>research + coding"])
+    you(("Your reaction<br/>within 90 s"))
 
-    mic --> hear
-    ptt --> llm
-    radar --> presence
-    presence --> who
+    buds --> vad --> stt --> hear
     hear --> mem
     hear --> who
     who -- yes --> ctx
-    prefix --> llm
-    ctx --> llm
     mem -. recall .-> ctx
-    llm <--> tools
+    prefix --> claude
+    ctx --> claude
+    claude <--> tools
     tools <--> mem
     tools <--> skills
-    llm --> out
+    tools -- ask_hermes --> hermes
+    hermes -- "report back (always speaks)" --> gate
+    claude -- reply --> tts
 
+    due --> gate
     feeds --> gate
-    presence --> gate
-    gate -- now --> out
+    ask --> tts
+    gate -- now --> tts
     gate -- later --> held
-    held -- "company leaves<br/>or owner talks" --> out
+    held -- "company leaves<br/>or you talk to FRIDAY" --> tts
+    tts --> buds
 
-    out --> owner
-    owner -- "pushback / engagement<br/>tunes per-kind score" --> gate
+    tts --> you
+    you -- "not now / engaged<br/>tunes each kind" --> gate
+    you -- "answers become<br/>preferences + interests" --> mem
+    mem -. interests .-> feeds
 
-    mem --> consolidate --> mem
-    llm -. worklog .-> review --> skills
+    mem --> keep --> mem
+    claude -. worklog .-> review --> skills
+    keep --> newq --> mem
     skills -. "index refreshed once a night" .-> prefix
 ```
 
-## The two learning loops
+## The learning loops
 
 ```mermaid
 flowchart LR
-    subgraph WHEN["Learns WHEN to speak (every interruption)"]
-        a1[FRIDAY interrupts] --> a2{Owner's reaction}
-        a2 -- "engages" --> a3[score up]
+    subgraph WHEN["When to speak (every interruption)"]
+        a1[FRIDAY interrupts] --> a2{Your reaction}
+        a2 -- engages --> a3[score up]
         a2 -- "not now, I know, stop" --> a4[score down]
         a3 & a4 --> a5{score below 0.4?}
-        a5 -- yes --> a6[that kind waits for a good moment]
+        a5 -- yes --> a6[waits for a good moment]
         a5 -- no --> a7[keeps interrupting]
     end
 
-    subgraph HOW["Learns HOW to do things (nightly)"]
-        b1[Tasks done with tools today] --> b2[Review with the model]
+    subgraph HOW["How to do things (nightly)"]
+        b1[Tasks done with tools today] --> b2[Claude reviews them]
         b2 --> b3[Write or fix SKILL.md]
         b3 --> b4[Index goes into tomorrow's prompt]
-        b4 --> b5[skill_view loads the steps when a request matches]
+        b4 --> b5[skill_view loads the steps when needed]
         b5 --> b1
+    end
+
+    subgraph WHO["Who you are (daily)"]
+        c1[One preference question] --> c2[Your answer]
+        c2 --> c3[Preference + interests saved]
+        c3 --> c4[Hacker News watches those topics]
+        c3 --> c5[Nightly: new questions from what's still unknown]
+        c5 --> c1
     end
 ```
 
-## Why it stays fast on a small model
+## Design rules
 
-- **Cached prefix.** The persona, skill index and tool list are byte-identical on every turn, so
-  llama.cpp and vLLM only process the new message. The prefix changes once a night, when new skills land.
-- **Progressive disclosure.** Each skill is one line in the prompt. The steps load only when used.
-- **Capped context.** 8 facts, 4 memories, 12 history messages, 3,000 characters per tool result.
+- **The prompt prefix stays fixed.** Persona, skill index and tool list are byte-identical every turn, so
+  Claude's prompt cache covers them. The per-turn context is small and capped. The prefix changes once a
+  night, when new skills land.
+- **Watching costs nothing.** Feeds are plain HTTP and string matching; Claude is only called when you
+  talk to FRIDAY, for routines, and in the nightly pass.
+- **Quick decisions are typed.** Whether a line was meant for FRIDAY, what to keep from the day, which
+  skills to write, which questions to ask: each comes back as a validated Pydantic object, not text
+  to parse.
+- **Assist, don't automate.** Tools read, remember and report. Hermes is consulted, not given control.
+  Text from tools is information, never instructions.
 
-Skills and the progressive-disclosure design come from
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research (MIT), rewritten small.
-FRIDAY reads Hermes and agentskills.io `SKILL.md` files as they are.
+Skills and progressive disclosure are adapted from [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+by Nous Research (MIT). FRIDAY reads Hermes and agentskills.io `SKILL.md` files as they are.

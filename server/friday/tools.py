@@ -1,5 +1,4 @@
 """The tools FRIDAY's brain can call. Each is a plain async function plus a JSON schema."""
-import base64
 import json
 from datetime import datetime
 
@@ -13,9 +12,8 @@ class Tools:
         def wrap(fn):
             props = {k.rstrip("_"): {"type": t, "description": d} for k, (t, d) in params.items()}
             required = [k for k in params if not k.endswith("_")]
-            self._schemas.append({"type": "function", "function": {
-                "name": fn.__name__, "description": doc,
-                "parameters": {"type": "object", "properties": props, "required": required}}})
+            self._schemas.append({"name": fn.__name__, "description": doc,
+                                  "input_schema": {"type": "object", "properties": props, "required": required}})
             self._fns[fn.__name__] = fn
             return fn
         return wrap
@@ -35,18 +33,19 @@ class Tools:
 
 
 def build(state):
-    """state: the app's shared objects (memory, feeds, calls, llm, settings, location)."""
-    t, mem, feeds, s = Tools(), state.memory, state.feeds, state.settings
+    """The core tools. Plugins add theirs to the same registry (see plugins.py)."""
+    t, mem = Tools(), state.memory
 
-    def here():
-        loc = state.location or {}
-        return loc.get("lat", s.home_lat), loc.get("lon", s.home_lon)
-
-    @t.tool("Save a durable fact about the owner or people in their life.",
-            text=("string", "the fact, self-contained"), category_=("string", "person|preference|health|work|place|other"))
+    @t.tool("Save a durable fact about the owner: an interest, a preference, how they like things done.",
+            text=("string", "the fact, self-contained"), category_=("string", "interest|preference|work|place|other"))
     async def remember(text, category="other"):
         mem.remember(text, category)
         return {"saved": text}
+
+    @t.tool("Forget saved facts that match (the owner says something is wrong or private).",
+            text=("string", "words from the fact to forget"))
+    async def forget(text):
+        return {"forgot": mem.forget(text)}
 
     @t.tool("Search everything FRIDAY has heard, been told, or summarized.", query=("string", "what to look for"))
     async def recall(query):
@@ -83,50 +82,6 @@ def build(state):
             body=("string", "short numbered steps naming the tools to call, plus pitfalls"))
     async def skill_save(name, description, body):
         return {"saved": state.skills.save(name, description, body)}
-
-    @t.tool("Weather alerts and earthquakes near the owner right now.")
-    async def situation():
-        lat, lon = here()
-        out = {"lat": lat, "lon": lon}
-        for key, fn in (("alerts", feeds.alerts), ("quakes", feeds.quakes)):
-            try:
-                out[key] = await fn(lat, lon)
-            except Exception as e:
-                out[key] = f"unavailable ({type(e).__name__})"
-        return out
-
-    @t.tool("List public traffic cameras near a point (defaults to the owner's location). Covers NYC, London, California.",
-            lat_=("number", "latitude"), lon_=("number", "longitude"))
-    async def cameras_near(lat=None, lon=None):
-        if lat is None or lon is None:
-            lat, lon = here()
-        cams = await feeds.cameras_near(lat, lon)
-        return {"cameras": [{k: c[k] for k in ("id", "name", "provider", "km")} for c in cams]}
-
-    async def describe(img, question):
-        msg = await state.llm.chat([{"role": "user", "content": [
-            {"type": "text", "text": question},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(img).decode()}}]}],
-            model=s.vision_model, max_tokens=200)
-        return msg.get("content")
-
-    @t.tool("Look at a public traffic camera's latest frame and describe it.",
-            camera_id=("string", "id from cameras_near"), question_=("string", "what to look for"))
-    async def look_at_camera(camera_id, question="Describe traffic, weather and any incident in one sentence."):
-        img = await feeds.frame(camera_id)
-        if not img:
-            return {"error": "no such camera"}
-        return {"camera": camera_id, "sees": await describe(img, question)}
-
-    @t.tool("Unread GitHub notifications.")
-    async def github():
-        return {"notifications": (await feeds.github())[:15]}
-
-    @t.tool("Have FRIDAY phone someone in the background on the owner's behalf (book, ask, wait on hold) and report back. "
-            "FRIDAY discloses it's an AI assistant.",
-            number=("string", "E.164 phone number"), goal=("string", "what to accomplish on the call"))
-    async def call_on_my_behalf(number, goal):
-        return {"call_id": await state.calls.place(number, goal), "status": "dialing"}
 
     return t
 
