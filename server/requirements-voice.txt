@@ -1,6 +1,5 @@
-# The earbud voice loop (friday.ears). Heavier; the server and tests don't need it.
+# Speech on the server: Whisper (hearing) and Piper (speaking). The Docker image has these;
+# tests and the CLI don't need them.
 faster-whisper>=1.1
-webrtcvad-wheels>=2.0.14
-websockets>=12
 numpy
 piper-tts==1.3.0

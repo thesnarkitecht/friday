@@ -1,16 +1,13 @@
-# FRIDAY in one container: server, voice loop, plugins, and every credential (from .env).
+# FRIDAY in one container: server, speech (Whisper + Piper), plugins, and every credential (from .env).
+# Ears and voice are any device running the `friday` CLI with headphones paired: no audio setup here.
 services:
   friday:
     build: ./server
     restart: unless-stopped
     env_file: .env
-    environment:
-      # Reach the host's PipeWire/PulseAudio, where the paired earbuds live.
-      PULSE_SERVER: unix:/run/user/1000/pulse/native
     ports:
       - "8080:8080"   # keep this on your LAN / Tailscale only
     volumes:
       - ./data:/data                                   # memory db, FRIDAY's skills, whisper models
       - ./server/plugins:/app/plugins:ro               # add plugins without rebuilding
       - ${HOME}/.config/anthropic:/root/.config/anthropic:ro   # `ant auth login` profile
-      - /run/user/1000/pulse:/run/user/1000/pulse      # audio

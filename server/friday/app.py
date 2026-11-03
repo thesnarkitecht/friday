@@ -1,5 +1,6 @@
 """FRIDAY server. Run: uvicorn friday.app:app --host 0.0.0.0 --port 8080"""
 import asyncio
+import base64
 import hmac
 import json
 import re
@@ -20,6 +21,7 @@ from .brain import Brain
 from .llm import Claude
 from .memory import SEED_QUESTIONS, Memory
 from .skills import Skills
+from .voice import Voice
 
 
 # Kinds that interrupt no matter what: the owner asked for them, or they're about safety.
@@ -31,11 +33,12 @@ PUSHBACK = re.compile(r"\b(stop|enough|shut up|quiet|not now|later|don'?t care|w
                       r"don'?t (tell|need|want)|i know|whatever|no one asked|annoying)\b", re.I)
 
 
-def create_app(settings=None, llm=None, background=True, http=None):
+def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     s = settings or config.load()
     if not s.token:
         raise RuntimeError("Set FRIDAY_TOKEN: the server holds your life, it doesn't run unauthenticated.")
-    state = SimpleNamespace(settings=s, clients=set())
+    state = SimpleNamespace(settings=s, clients=set(), voice_clients=set())
+    state.voice = voice or Voice()
     state.llm = llm or Claude(s.model)
     state.http = http or httpx.AsyncClient(timeout=20, headers={"User-Agent": "friday-assistant"})
     state.memory = Memory(s.db, s.retain_days, s.keep_importance, s.record_others)
@@ -44,9 +47,16 @@ def create_app(settings=None, llm=None, background=True, http=None):
     state.addressee = Addressee()
 
     async def broadcast(msg):
+        """Send to every connected client. Devices in voice mode also get FRIDAY's words as speech."""
+        audio = None
+        if msg.get("type") in ("say", "notify") and state.voice_clients:
+            try:
+                audio = base64.b64encode(await asyncio.to_thread(state.voice.speak, msg["text"])).decode()
+            except Exception:
+                pass  # the text still arrives; a voice glitch shouldn't silence FRIDAY entirely
         for ws in list(state.clients):
             try:
-                await ws.send_json(msg)
+                await ws.send_json({**msg, "audio": audio} if audio and ws in state.voice_clients else msg)
             except Exception:
                 state.clients.discard(ws)
         return len(state.clients)
@@ -196,10 +206,30 @@ def create_app(settings=None, llm=None, background=True, http=None):
                         pass  # a garbled sensor message shouldn't drop the connection
                 elif msg.get("type") == "utterance" and msg.get("text", "").strip():
                     await hear(msg["text"], msg.get("speaker", "unknown"), msg.get("others_present"))
+                elif msg.get("type") == "ask" and str(msg.get("text", "")).strip():  # typed: always for FRIDAY
+                    text = str(msg["text"]).strip()
+                    state.memory.add_utterance(text, speaker="owner", addressed=True)
+                    await broadcast({"type": "heard", "text": text, "addressed": True})
+                    await converse(text)
+                elif msg.get("type") == "hello" and msg.get("voice"):
+                    ok = await asyncio.to_thread(state.voice.available)
+                    if ok:
+                        state.voice_clients.add(socket)
+                    await socket.send_json({"type": "ready", "voice": ok, **({} if ok else {
+                        "why": "this server has no speech models (run the Docker image)"})})
+                elif msg.get("type") == "audio" and socket in state.voice_clients:
+                    try:
+                        pcm = base64.b64decode(msg["pcm"], validate=True)
+                    except (KeyError, TypeError, ValueError):
+                        continue  # garbled audio shouldn't drop the connection
+                    text = await asyncio.to_thread(state.voice.transcribe, pcm)
+                    if text:
+                        await hear(text, msg.get("speaker", "unknown"))
         except WebSocketDisconnect:
             pass
         finally:
             state.clients.discard(socket)
+            state.voice_clients.discard(socket)
 
     @app.post("/api/utterance", dependencies=[Depends(auth)])
     async def utterance(body: dict):

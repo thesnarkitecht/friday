@@ -1,25 +1,26 @@
 # FRIDAY
 
-A proactive voice assistant that lives in your earbuds. It listens all day, keeps what matters and drops
-the rest, learns your tastes by asking, and speaks up when something you care about happens. It assists;
-it doesn't automate.
+A proactive voice assistant you talk to through whatever headphones you're wearing. It listens all day,
+follows the conversation, keeps what matters and drops the rest, learns your tastes by asking, and
+speaks up when something you care about happens. It assists; it doesn't automate.
 
 ```
-Bluetooth earbuds ──► ears (speech detection + Whisper, on your box) ──► FRIDAY server ──► Claude
-        ▲                                                                  │   │   │
-        └──────────── Piper voice ◄──── replies, alerts, questions ◄───────┘   │   └── plugins: new models,
-                                                                               │       Hacker News, Hermes…
-                                                       memory + skills (SQLite, SKILL.md)
+any device + paired headphones                    one Docker container
+┌──────────────────────────┐   audio / text   ┌────────────────────────────────────────────┐
+│ friday                   │ ───────────────► │ Whisper → "meant for me?" → Claude + tools │
+│  mic → speech detection  │                  │ memory · nightly skills · questions        │
+│  speaker ◄─ FRIDAY voice │ ◄─────────────── │ Piper voice · plugins (models, HN, Hermes) │
+└──────────────────────────┘   speech / text  └────────────────────────────────────────────┘
 ```
-
-Everything runs in **one Docker container**: the server, the voice loop, every plugin, and every
-credential (one `.env` file). No MCP servers.
 
 ## What it does
 
-- **Hears you through paired Bluetooth earbuds.** Speech is transcribed on your machine. It answers when
-  you say "Friday…", for 10 seconds after it speaks, or when Claude decides an ambiguous line was meant
-  for it. Voices it's told aren't yours can never command it.
+- **One command, any device.** Pair your headphones with a laptop, desktop or Pi, run `friday`, and
+  talk. Speech is transcribed on your own server; nothing goes anywhere else except the words FRIDAY
+  sends to Claude.
+- **Knows what you're talking about.** It answers "Friday, …", follow-ups, and, when you're alone, plain
+  requests like "remind me to…" or "look that up". It sees the last few minutes of conversation, so "what
+  do you think?" means what you were just discussing.
 - **Answers with Claude.** Sign in once with `ant auth login` (or use an API key). Quick decisions
   (was that for me? what's worth remembering?) come back as type-checked structured output.
 - **Keeps what's needed, throws away the rest.** Every line gets an importance score. Each night it turns
@@ -40,13 +41,15 @@ credential (one `.env` file). No MCP servers.
 - **Knows when to interrupt.** Reminders and things you asked for always speak. Everything else waits
   while you have company or during quiet hours (22:00–08:00 by default), and learns from your reactions:
   say "not now" and that kind of alert starts waiting for a good moment instead.
-- **Drivable from a terminal.** `friday ask`, `friday chat`, `friday watch` (live view of what it hears,
-  says and holds back), `friday status`, `friday memory`, `friday forget`.
+- **Also typed.** Type while talking, or use `friday ask`, `friday chat`, `friday status`,
+  `friday memory` and `friday forget`.
 - **Works with any OpenAI-compatible client.** Point Open WebUI, LibreChat, a script, or anything that
   speaks the OpenAI API at `http://<box>:8080/v1`, with your `FRIDAY_TOKEN` as the API key and `friday`
   as the model. Streaming works.
 
 ## Run it
+
+On the always-on box:
 
 ```bash
 cp .env.example .env      # set FRIDAY_TOKEN, your name, and plugin credentials
@@ -54,29 +57,29 @@ ant auth login            # Claude sign-in (or set ANTHROPIC_API_KEY in .env)
 docker compose up -d --build
 ```
 
-Pair your earbuds with the host first (see [docs/GUIDE.md](docs/GUIDE.md)). Then:
-
-```bash
-docker compose exec friday friday chat
-```
-
-Or from any machine on your network:
+On each device you'll talk from (headphones paired):
 
 ```bash
 pip install ./server
 ```
 
 ```bash
-FRIDAY_URL=http://<box>:8080 FRIDAY_TOKEN=... friday watch
+friday login http://<box>:8080 <FRIDAY_TOKEN>
 ```
 
-From Python, or any OpenAI client:
+```bash
+friday
+```
+
+Any OpenAI client works too:
 
 ```python
 from openai import OpenAI
 friday = OpenAI(base_url="http://<box>:8080/v1", api_key="<FRIDAY_TOKEN>")
 print(friday.chat.completions.create(model="friday", messages=[{"role": "user", "content": "Anything new?"}]).choices[0].message.content)
 ```
+
+Setup details, headphone tips and every command: [docs/GUIDE.md](docs/GUIDE.md).
 
 Tests:
 `cd server && pip install -r requirements.txt && python -m pytest -q`
@@ -88,7 +91,6 @@ for the proactive loop, and skills. See `server/friday/plugins.py` for the whole
 `server/plugins/models/plugin.py` for a 30-line example. Credentials go in `.env`.
 
 **How it works:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (diagrams).
-**Setup, hardware and earbuds:** [docs/GUIDE.md](docs/GUIDE.md).
 
 Skills and progressive disclosure are adapted from [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 by Nous Research (MIT).

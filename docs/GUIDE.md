@@ -1,111 +1,98 @@
-# FRIDAY guide: setup, earbuds, plugins, and how it decides to speak
+# FRIDAY guide: setup, headphones, plugins, and how it decides to speak
+
+FRIDAY has two parts:
+- **The server** (one Docker container on an always-on box) holds the brain, memory, plugins, speech
+  recognition and voice.
+- **The `friday` command** runs on any device you carry or sit at (laptop, desktop, a Pi) and uses whatever
+  headphones are paired with that device as FRIDAY's ears and voice. The device does almost no work, so
+  anything that runs Python 3.10+ is enough.
 
 ## What you need
 
 | Item | Why | Cost |
 |---|---|---|
-| A Linux box that's always on: a Raspberry Pi 5 (8 GB), a mini PC, or your home server | Runs the container. Whisper `base.en` transcribes comfortably on a Pi 5; use `tiny.en` if it lags | about $80+ |
-| Bluetooth earbuds with a mic | Ears and voice. Any pair that works as a headset | — |
+| An always-on box: a mini PC, home server, or Raspberry Pi 5 (8 GB) | Runs the container. Whisper `base.en` is comfortable on a Pi 5; use `tiny.en` if it lags | about $80+ |
+| Headphones or earbuds with a mic, paired to the device you're using | Ears and voice | — |
 | A Claude sign-in or API key | The brain | API usage |
-| *Optional:* room radars (below) | Lets FRIDAY know when you have company at home | about $20/room |
+| *Optional:* room radars (below) | Tells FRIDAY when you have company at home | about $20/room |
 | *Optional:* Hermes Agent running somewhere | Heavy research and coding | free (MIT) |
+| *Optional:* Tailscale on the box and your devices | Reach FRIDAY from anywhere, not just home Wi-Fi | free personal plan |
 
-Bluetooth reaches about 10 m, so FRIDAY hears you around the house, not across town. To take it with you,
-run the same container on a Pi 5 in your pocket (official Active Cooler plus a 20,000 mAh 5 V/3 A power bank).
-
-## Setup
-
-### 1. Pair the earbuds with the host
-
-```bash
-bluetoothctl
-```
-
-Then, inside `bluetoothctl`: `power on`, `scan on`, `pair <MAC>`, `trust <MAC>`, `connect <MAC>`.
-
-Switch them to the headset profile, which turns the mic on. A2DP is music-only and has no mic:
-
-```bash
-pactl list cards short
-```
-
-```bash
-pactl set-card-profile bluez_card.<MAC_with_underscores> headset-head-unit
-```
-
-Make them the default input and output (`pactl set-default-source …` / `pactl set-default-sink …`), or use
-your desktop's sound settings. FRIDAY uses whatever the defaults are.
-
-Headset mode is lower-fidelity audio (mSBC, 16 kHz), which is fine for speech and exactly the rate Whisper wants.
-
-### 2. Credentials
+## 1. Start the server
 
 ```bash
 cp .env.example .env
 ```
 
 Set `FRIDAY_TOKEN` (long and random), `FRIDAY_OWNER_NAME`, and any plugin settings. For Claude, either:
-- **Sign in:** install the `ant` CLI on the host and run `ant auth login`. Compose mounts that profile into
-  the container read-only, and the Anthropic SDK picks it up.
+- **Sign in:** install the `ant` CLI on the box and run `ant auth login`. Compose mounts that profile into
+  the container read-only.
 - **API key:** set `ANTHROPIC_API_KEY` in `.env`.
 
 A Claude Pro/Max chat subscription can't power a third-party server like this; it bills as API usage.
-
-### 3. Start
 
 ```bash
 docker compose up -d --build
 ```
 
-```bash
-docker compose logs -f
-```
+## 2. Set up each device
 
-The compose file mounts `/run/user/1000/pulse` for audio. If your user ID isn't 1000 (`id -u`), change
-both paths in `docker-compose.yml`.
-
-### 4. Check it
-
-```bash
-curl -H "Authorization: Bearer $FRIDAY_TOKEN" -H "Content-Type: application/json" -d '{"text":"What do you know about me?"}' localhost:8080/api/ask
-```
-
-`GET /api/hud` shows loaded plugins (and any that failed), the situation FRIDAY sees, learned
-interruption scores, and recent speech.
-
-## Driving it
-
-### From a terminal
-
-Inside the container:
-
-```bash
-docker compose exec friday friday chat
-```
-
-From another machine (needs Python 3.10+):
+Pair your headphones with the device the normal way (Bluetooth settings), then:
 
 ```bash
 pip install ./server
 ```
 
+On Linux, also install PortAudio for the mic: `sudo apt install libportaudio2`. macOS and Windows need nothing extra.
+
 ```bash
-export FRIDAY_URL=http://<box>:8080 FRIDAY_TOKEN=...
+friday login http://<box>:8080 <FRIDAY_TOKEN>
 ```
+
+```bash
+friday
+```
+
+That's it: you're talking to FRIDAY. You see a live transcript, FRIDAY's voice comes through your
+headphones, and you can type at the same time. It uses the device's default mic and speaker; with
+Bluetooth headphones connected, those are usually the headphones. `friday devices` lists everything, and
+`friday --mic 3 --speaker 5` picks specific ones.
+
+On Linux, Bluetooth headphones only have a mic in "headset" mode. Pick it in your sound settings, or:
+
+```bash
+pactl set-card-profile bluez_card.<MAC_with_underscores> headset-head-unit
+```
+
+Several devices can be connected at once. Every one sees the conversation, and the ones in voice mode
+hear FRIDAY.
+
+## 3. Talking to it
+
+- **"Friday, …"** always works.
+- **Follow-ups** for 10 seconds after FRIDAY speaks need no name.
+- **Alone, you can just ask.** Lines that sound like a request ("remind me to…", "what's…", "look that
+  up", "what do you think") go to a quick check by Claude of whether you meant FRIDAY or were thinking out
+  loud. With company, you need its name.
+- **It knows what you were just talking about.** When you ask, FRIDAY also sees the last 5 minutes of
+  what was said around you, so "Friday, what do you think?" or "look that up" works without repeating yourself.
 
 | Command | What it does |
 |---|---|
+| `friday` | Talk (voice + live transcript + typing) |
 | `friday ask "…"` | One question, one answer (plus a catch-up line if things were held for you) |
-| `friday chat` | Back-and-forth until Ctrl-D |
+| `friday chat` | Typed back-and-forth until Ctrl-D |
+| `friday watch` | Live transcript only, no mic |
 | `friday heard "…"` | As if overheard; FRIDAY decides whether it was meant for it |
-| `friday watch` | Live: what FRIDAY hears, says, and alerts |
 | `friday status` | Plugins, situation, what it learned about interrupting you, skills, routines, recent alerts |
 | `friday memory [query]` | What it knows about you, or a search |
 | `friday forget "…"` | Delete facts containing that text |
+| `friday devices` | List mics and speakers |
 
-Typed and spoken conversations are the same conversation: what you type counts as you talking to FRIDAY.
+Inside the server container the same command works without logging in:
+`docker compose exec friday friday ask "…"`.
 
-### From OpenAI-compatible clients
+## OpenAI-compatible clients
 
 Base URL `http://<box>:8080/v1`, API key = `FRIDAY_TOKEN`, model `friday`. `/v1/models` and
 `/v1/chat/completions` (with or without streaming) are supported. FRIDAY keeps its own memory and
@@ -189,7 +176,7 @@ sensor:
 
 | Endpoint | Use |
 |---|---|
-| `WS /ws?token=…` | Send `{"type":"utterance","text":…}` or `{"type":"presence","room":…,"people":…}`. Receive `heard`, `say`, `notify`, `memory` |
+| `WS /ws?token=…` | Send `utterance` (text heard), `ask` (typed: always for FRIDAY), `presence`, or `hello` `{"voice": true}` then `audio` (`pcm`: base64 16 kHz mono 16-bit). Receive `heard`, `say`, `notify`, `memory`; voice clients also get `audio` (base64 WAV) on `say`/`notify` |
 | `POST /api/utterance` | Everything heard; FRIDAY decides whether it was addressed |
 | `POST /api/ask` | CLI / push-to-talk: always addressed. Returns `reply` and `catch_up` |
 | `POST /api/forget` | Delete facts containing `text` |

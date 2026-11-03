@@ -1,10 +1,8 @@
 FROM python:3.12-slim
-# pulseaudio-utils: parec/paplay talk to the host's PipeWire (earbuds) through the mounted socket.
-RUN apt-get update && apt-get install -y --no-install-recommends pulseaudio-utils && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt requirements-voice.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-voice.txt
-# Piper voice baked in so the container needs no download at runtime.
+# Speech runs here (Whisper in, Piper out) so the devices with headphones stay light. Voice baked in.
 RUN mkdir -p /opt/voices && python -m piper.download_voices --data-dir /opt/voices en_US-lessac-medium
 COPY friday ./friday
 COPY pyproject.toml ./

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from friday import config, plugins
 from friday.addressee import Addressee
 from friday.app import create_app
-from friday.ears import FRAME_BYTES, Segmenter
+from friday.cli import FRAME, Segmenter
 from friday.memory import Memory, importance
 from friday.proactive import tick
 from friday.skills import Skills
@@ -116,6 +116,9 @@ def test_search_survives_fts_syntax_and_forget_works(tmp_path):
     ("see you on Friday", "no"),
     ("Friday night we're going out", "no"),
     ("pass the salt", "no"),
+    ("remind me to call the dentist", "maybe"),  # alone + sounds like a request: Claude decides
+    ("what's the latest on that new model", "maybe"),
+    ("I think it'll rain", "no"),
 ])
 def test_wake_word(text, verdict):
     assert Addressee().check(text, now=1000)[0] == verdict
@@ -390,10 +393,10 @@ def test_routines_run_once_per_day_on_their_days(tmp_path):
 
 # --- ears ------------------------------------------------------------------------------
 def test_segmenter_cuts_utterances_on_silence_and_drops_blips():
-    seg, f = Segmenter(end_ms=90, min_ms=60), b"\0" * FRAME_BYTES
+    seg, f = Segmenter(end_ms=90, min_ms=60), b"\0" * FRAME * 2
     assert seg.push(f, False) is None  # silence before speech is ignored
     out = [seg.push(f, s) for s in (True, True, True, False, False, False)]
-    assert out[:-1] == [None] * 5 and len(out[-1]) == 6 * FRAME_BYTES
+    assert out[:-1] == [None] * 5 and len(out[-1]) == 6 * FRAME * 2
     out = [seg.push(f, s) for s in (True, False, False, False)]  # one 30 ms blip
     assert out == [None] * 4
 
@@ -473,3 +476,90 @@ def test_no_claude_credentials_at_all_is_spoken(tmp_path, monkeypatch, empty_pro
         monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path))
     with pytest.raises(Unavailable, match="not signed in"):
         asyncio.run(Claude().chat("s", [{"role": "user", "content": "hi"}]))
+
+
+
+# --- any device with headphones ----------------------------------------------------------
+class FakeVoice:
+    def __init__(self):
+        self.heard = []
+
+    def available(self):
+        return True
+
+    def transcribe(self, pcm):
+        self.heard.append(len(pcm))
+        return "Friday, did a new model drop?"
+
+    def speak(self, text):
+        return b"RIFF" + text.encode()
+
+
+def test_a_headphone_device_talks_and_hears_friday(tmp_path):
+    import base64
+    voice = FakeVoice()
+    app = create_app(settings(tmp_path), llm=FakeLLM("Yes, two this morning."), background=False, voice=voice)
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws?token=secret") as phone, c.websocket_connect("/ws?token=secret") as laptop:
+            phone.receive_json(); laptop.receive_json()
+            phone.send_json({"type": "hello", "voice": True})
+            assert phone.receive_json() == {"type": "ready", "voice": True}
+            phone.send_json({"type": "audio", "pcm": "not base64!!"})  # ignored, connection survives
+            phone.send_json({"type": "audio", "pcm": base64.b64encode(b"\0" * 3200).decode()})
+            assert phone.receive_json()["text"] == "Friday, did a new model drop?"
+            said = phone.receive_json()
+            assert said["text"] == "Yes, two this morning."
+            assert base64.b64decode(said["audio"]) == b"RIFFYes, two this morning."  # voice device gets speech
+            laptop.receive_json()
+            assert "audio" not in laptop.receive_json()  # text-only device gets text
+    assert voice.heard == [3200]
+
+
+def test_server_without_speech_models_says_so(tmp_path):
+    class NoVoice(FakeVoice):
+        def available(self):
+            return False
+    app = create_app(settings(tmp_path), llm=FakeLLM(), background=False, voice=NoVoice())
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "hello", "voice": True})
+        assert ws.receive_json()["voice"] is False
+
+
+def test_typing_while_listening_always_reaches_friday(tmp_path):
+    app = create_app(settings(tmp_path), llm=FakeLLM("On it."), background=False)
+    with TestClient(app) as c, c.websocket_connect("/ws?token=secret") as ws:
+        ws.receive_json()
+        ws.send_json({"type": "ask", "text": "look that up"})  # no wake word needed when typed
+        assert ws.receive_json() == {"type": "heard", "text": "look that up", "addressed": True}
+        assert ws.receive_json() == {"type": "say", "text": "On it."}
+
+
+def test_friday_knows_what_you_were_just_talking_about(tmp_path):
+    llm = FakeLLM("It's a solid pick for the Pi.")
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    f = app.state.friday
+    f.memory.add_utterance("should we use Qwen 3 or Llama for the Pi", speaker="unknown", ts=time.time() - 60)
+    f.memory.add_utterance("something from yesterday", speaker="unknown", ts=time.time() - 86400)
+    with TestClient(app) as c:
+        c.post("/api/utterance", json={"text": "Friday, what do you think?"}, headers=H)
+    ctx = llm.sent[0]["messages"][-1]["content"]
+    assert "should we use Qwen 3 or Llama for the Pi" in ctx and "yesterday" not in ctx
+
+
+def test_login_saves_url_and_token_privately(tmp_path, monkeypatch, capsys):
+    import os
+    import stat
+    from friday import cli
+    monkeypatch.setattr(cli, "CONFIG", str(tmp_path / "friday" / "config.json"))
+    monkeypatch.delenv("FRIDAY_TOKEN", raising=False)
+    monkeypatch.delenv("FRIDAY_URL", raising=False)
+    app = create_app(settings(tmp_path), llm=FakeLLM(), background=False)
+    with TestClient(app) as tc:
+        monkeypatch.setattr(cli.httpx, "Client", lambda **kw: TestClient(app, headers=kw.get("headers")))
+        cli.main(["login", "http://testserver", "secret"])
+    assert stat.S_IMODE(os.stat(cli.CONFIG).st_mode) == 0o600
+    assert cli.login_settings() == ("http://testserver", "secret")
+    with pytest.raises(SystemExit):
+        cli.main(["login", "http://testserver", "wrong"])  # a bad token is never saved
+    assert cli.login_settings()[1] == "secret"

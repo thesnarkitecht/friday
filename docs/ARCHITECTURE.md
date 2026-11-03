@@ -1,25 +1,27 @@
 # How FRIDAY works
 
-Everything below runs in one Docker container.
+The server is one Docker container. Ears and voice are any device running the `friday` command with
+headphones paired.
 
 ## The whole agent
 
 ```mermaid
 flowchart TB
-    subgraph EARS["Ears (friday/ears.py)"]
-        buds["Bluetooth earbuds<br/>headset mic"]
+    subgraph DEVICE["Any device: friday CLI + paired headphones"]
+        buds["Headphone mic + speaker"]
         vad["Speech detection<br/>cuts utterances"]
-        stt["Whisper on your box<br/>speech → text"]
-        tts["Piper voice<br/>→ earbuds"]
+        typed["Typing, friday ask,<br/>OpenAI clients"]
     end
 
-    subgraph SERVER["FRIDAY server"]
+    subgraph SERVER["FRIDAY server (one container)"]
+        stt["Whisper<br/>speech → text"]
+        tts["Piper<br/>text → speech"]
         hear["hear()<br/>score + remember every line"]
-        who{"Meant for FRIDAY?<br/>wake word · 10 s follow-up<br/>other voice → never<br/>with company → Claude decides (typed)"}
+        who{"Meant for FRIDAY?<br/>wake word · 10 s follow-up<br/>alone + sounds like a request → Claude decides (typed)<br/>other voice → never"}
 
         subgraph BRAIN["Brain"]
             prefix["Cached prefix<br/>persona + skill index + tools"]
-            ctx["Per-turn [context]<br/>time · situation · 8 facts · 4 memories"]
+            ctx["Per-turn [context]<br/>time · situation · last 5 min overheard<br/>8 facts · 4 memories"]
             claude(["Claude<br/>ant auth login / API key"])
             tools["Tools<br/>remember · forget · recall · reminders<br/>routines · skill_view · skill_save<br/>+ plugin tools"]
         end
@@ -43,11 +45,10 @@ flowchart TB
     end
 
     hermes(["Hermes Agent<br/>OpenAI-compatible API<br/>research + coding"])
-    clients["friday CLI · OpenAI clients<br/>/api/ask · /v1/chat/completions"]
     you(("Your reaction<br/>within 90 s"))
 
-    buds --> vad --> stt --> hear
-    clients -- "typed = you talking" --> ctx
+    buds --> vad -- "audio over /ws" --> stt --> hear
+    typed -- "typed = you talking" --> ctx
     hear --> mem
     hear --> who
     who -- yes --> ctx
@@ -67,9 +68,9 @@ flowchart TB
     gate -- now --> tts
     gate -- later --> held
     held -- "company leaves<br/>or you talk to FRIDAY" --> tts
-    tts --> buds
+    tts -- "speech over /ws" --> buds
 
-    tts --> you
+    buds --> you
     you -- "not now / engaged<br/>tunes each kind" --> gate
     you -- "answers become<br/>preferences + interests" --> mem
     mem -. interests .-> feeds
