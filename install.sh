@@ -2,11 +2,11 @@
 # FRIDAY in one line, no sudo:
 #   curl -fsSL https://raw.githubusercontent.com/thesnarkitecht/friday/main/install.sh | sh
 # Installs uv (if missing) and FRIDAY into ~/.local, then runs `friday setup`.
-# FRIDAY_REF picks a branch or tag (default: main).
+# FRIDAY_REF picks a branch or tag (default: main); FRIDAY_SRC installs from elsewhere (e.g. ./server).
 set -eu
 
 REF="${FRIDAY_REF:-main}"
-SRC="friday-assistant @ https://github.com/thesnarkitecht/friday/archive/${REF}.tar.gz#subdirectory=server"
+SRC="${FRIDAY_SRC:-friday-assistant @ https://github.com/thesnarkitecht/friday/archive/${REF}.tar.gz#subdirectory=server}"
 
 say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 

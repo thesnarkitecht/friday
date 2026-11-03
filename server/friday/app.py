@@ -39,7 +39,7 @@ def create_app(settings=None, llm=None, background=True, http=None, voice=None):
     if not s.token:
         raise RuntimeError("Set FRIDAY_TOKEN: the server holds your life, it doesn't run unauthenticated.")
     state = SimpleNamespace(settings=s, clients=set(), voice_clients=set())
-    state.voice = voice or Voice(piper_path=s.voice_path, models_dir=s.models_dir)
+    state.voice = voice or Voice(s.voice, s.models_dir)
     state.turn_lock, state.tasks, state.hush = asyncio.Lock(), set(), False
     state.llm = llm or (OpenAICompat(s.llm_url, s.llm_key, s.model) if s.llm_url else Claude(s.model))
     state.http = http or httpx.AsyncClient(timeout=20, headers={"User-Agent": "friday-assistant"})

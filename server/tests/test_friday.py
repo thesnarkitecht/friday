@@ -875,3 +875,15 @@ def test_doctor_reports_what_works(tmp_path, monkeypatch, capsys):
         cli.main(["doctor"])
     out = capsys.readouterr().out
     assert "Mic: no mic here" in out and "Brain: claude-opus-5-5 via Claude" in out and "Ears and voice" in out
+
+
+
+def test_a_broken_model_service_is_spoken_not_silence(tmp_path):
+    from friday.llm import OpenAICompat, is_local
+    assert is_local("http://localhost:11434/v1") and not is_local("https://openrouter.ai/api/v1")
+    llm = OpenAICompat("http://127.0.0.1:9/v1", "", "m", http=httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(502, text="Bad Gateway"))))
+    app = create_app(settings(tmp_path), llm=llm, background=False)
+    with TestClient(app) as c:
+        r = c.post("/api/ask", json={"text": "hi"}, headers=H).json()
+    assert "isn't answering properly (HTTP 502)" in r["reply"]

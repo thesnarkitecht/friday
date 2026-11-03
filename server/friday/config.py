@@ -31,8 +31,7 @@ def load():
         # Built-in plugins ship in the package; your own go in ~/.friday/plugins.
         plugin_roots=[str(PACKAGE / "builtin_plugins"), e("FRIDAY_PLUGINS_DIR") or str(home / "plugins")],
         voice=voice,
-        voice_path=e("FRIDAY_PIPER_VOICE") or str(home / "voices" / f"{voice}.onnx"),
-        models_dir=e("FRIDAY_MODELS_DIR") or str(home / "models"),  # speech recognition model
+        models_dir=e("FRIDAY_MODELS_DIR") or str(home / "models"),  # ears (SenseVoice) and voice
         # Any OpenAI-compatible API instead of Claude: set its base URL (e.g. http://localhost:11434/v1 for
         # Ollama, https://openrouter.ai/api/v1), key, and FRIDAY_MODEL.
         llm_url=e("FRIDAY_LLM_URL", ""),

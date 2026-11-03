@@ -6,24 +6,24 @@ talk over it, follows the conversation, greets you when you're back, checks in o
 and speaks up when something you care about happens. It assists; it doesn't automate.
 
 ```bash
-pip install ./server
+curl -fsSL https://raw.githubusercontent.com/thesnarkitecht/friday/main/install.sh | sh
 ```
 
-```bash
-ant auth login
-```
+No sudo, no Docker, no server: it installs into `~/.local` (bringing its own Python via
+[uv](https://docs.astral.sh/uv/)), then `friday setup` asks your name and which brain to use. After
+that, put your headphones on and run `friday`. Everything FRIDAY knows lives in `~/.friday`.
 
-```bash
-friday
-```
-
-That's the whole setup: no server, no Docker. Everything FRIDAY knows lives in `~/.friday`.
-(Linux also needs `sudo apt install libportaudio2` for the mic.)
+(The one-liner needs this repository to be public; until then, clone it and run
+`FRIDAY_SRC=./server sh install.sh`.)
 
 ## What it's like
 
 - **Instant.** FRIDAY speaks each sentence the moment it's written, so you hear the start of the answer
   while the rest is still being thought. Talk over it and it stops at once and listens.
+- **Hears how you said it.** Its ears are [SenseVoice](https://github.com/FunAudioLLM/SenseVoice): punctuated
+  text in about 0.2 s, plus your tone and sounds like laughter. Sound frustrated and FRIDAY knows.
+- **Any brain.** Claude by default, or any OpenAI-compatible API: OpenRouter, Ollama, LM Studio,
+  llama.cpp, vLLM, OpenAI. Tools, streaming and structured decisions work with all of them.
 - **Knows what you're talking about.** Say "Friday, …", follow up without its name, or, when you're alone,
   just ask ("remind me to…", "look that up"). It hears the last few minutes of conversation, so "what do
   you think?" means what you were just discussing.
@@ -39,6 +39,11 @@ That's the whole setup: no server, no Docker. Everything FRIDAY knows lives in `
   new model releases from the big labs and for Hacker News stories about your interests.
 - **Knows when not to interrupt.** Reminders always speak. Everything else waits while you have company
   or during quiet hours (22:00–08:00 by default). It learns from "not now" and from what you engage with.
+- **Maps your world.** FRIDAY builds a graph of the projects, tools, topics, places and people in your
+  life and how they connect, from conversation and every night. `friday graph` shows it (or exports
+  Mermaid / Graphviz / JSON).
+- **Your data is yours.** `friday export` saves everything to one JSON file; `friday import` merges it
+  into another FRIDAY, or learns from any notes or text file you give it.
 - **Remembers what matters, forgets the rest.** Each night it keeps facts, a summary and reminders, deletes
   raw speech that didn't matter, and rewrites its own small how-to skills from what it did that day. No
   audio is ever stored.
@@ -58,8 +63,9 @@ Now every device shares one memory and one personality. `friday logout` goes bac
 
 ## Also
 
-- **Typing:** type while talking, or use `friday ask "…"`, `friday chat`, `friday status`, `friday memory`,
-  `friday forget "…"`.
+- **Everything from the CLI:** `friday setup`, `friday config set NAME VALUE`, `friday doctor`, `friday ask "…"`,
+  `friday chat`, `friday status`, `friday memory`, `friday forget "…"`, `friday graph`, `friday export`,
+  `friday import`. Type while talking, too.
 - **OpenAI-compatible:** point Open WebUI, LibreChat or any OpenAI client at `http://<hub>:8080/v1`, with
   your token as the API key and `friday` as the model.
 - **Plugins:** a folder with a `plugin.py` in `~/.friday/plugins/` adds tools, zero-token watchers and skills.
@@ -68,5 +74,7 @@ Now every device shares one memory and one personality. `friday logout` goes bac
 **More:** [docs/GUIDE.md](docs/GUIDE.md) (every setting and command) and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (diagrams).
 Tests: `pip install -e "./server[test]"`, then `cd server && python -m pytest -q`.
+Linux without PortAudio uses the system's own `parec`/`paplay` or `arecord`/`aplay`, so nothing needs sudo.
 
-Skills and progressive disclosure are adapted from Hermes Agent by Nous Research (MIT).
+Skills and progressive disclosure are adapted from Hermes Agent by Nous Research (MIT). Speech runs on
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx): SenseVoice for hearing, a Piper voice for speaking.

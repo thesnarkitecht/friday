@@ -2,39 +2,49 @@
 
 ## Setup (one device)
 
-You need headphones or earbuds with a mic, paired with the device, and a Claude sign-in or API key.
+You need headphones or earbuds with a mic, paired with the device, and a brain: a Claude API key, a
+Claude sign-in (`ant auth login`), or any OpenAI-compatible API.
 
 ```bash
-pip install ./server
+curl -fsSL https://raw.githubusercontent.com/thesnarkitecht/friday/main/install.sh | sh
 ```
 
-On Linux, also install PortAudio for the mic: `sudo apt install libportaudio2`. macOS and Windows need nothing extra.
-
-```bash
-ant auth login
-```
-
-Or put `ANTHROPIC_API_KEY=…` in `~/.friday/.env`. A Claude Pro/Max chat subscription can't power an app
-like this; it bills as API usage.
+This installs uv (which brings its own Python) and FRIDAY into `~/.local`; nothing needs sudo. Then
+`friday setup` asks your name and your brain, downloads FRIDAY's ears and voice (about 300 MB, once), and
+runs `friday doctor`. From a clone instead: `FRIDAY_SRC=./server sh install.sh`, or `pip install ./server`.
 
 ```bash
 friday
 ```
 
-The first run downloads FRIDAY's voice (about 60 MB) and speech recognition model (about 150 MB), once.
-After that you see a live transcript, FRIDAY's voice comes through your headphones, and you can type at
-the same time.
+You see a live transcript, FRIDAY's voice comes through your headphones, and you can type at the same time.
 
 It uses the device's default mic and speaker; with Bluetooth headphones connected, those are usually the
 headphones. `friday devices` lists everything, and `friday --mic 3 --speaker 5` picks specific ones. On
-Linux, Bluetooth headphones only have a mic in "headset" mode. Pick it in your sound settings, or:
+Linux without PortAudio, FRIDAY uses the system's own recorder and player (`parec`/`paplay` or
+`arecord`/`aplay`) and the devices chosen in your sound settings. Bluetooth headphones only have a mic in
+"headset" mode there. Pick it in your sound settings, or:
 
 ```bash
 pactl set-card-profile bluez_card.<MAC_with_underscores> headset-head-unit
 ```
 
-Settings and plugin credentials go in `~/.friday/.env` (copy `.env.example`). Everything FRIDAY keeps is
-in `~/.friday`: memory (`friday.db`), its skills, the voice, and this device's login.
+Everything FRIDAY keeps is in `~/.friday`: memory (`friday.db`), its skills, the speech models, settings
+(`.env`), and this device's login.
+
+### Choosing a brain
+
+`friday setup` asks, or set it any time:
+
+| Brain | Settings |
+|---|---|
+| Claude (default) | `friday config set ANTHROPIC_API_KEY sk-ant-…`, or `ant auth login` |
+| Ollama on this machine | `friday config set FRIDAY_LLM_URL http://localhost:11434/v1`, `friday config set FRIDAY_MODEL llama3.3` |
+| OpenRouter | `FRIDAY_LLM_URL https://openrouter.ai/api/v1`, `FRIDAY_LLM_KEY sk-or-…`, `FRIDAY_MODEL anthropic/claude-opus-5.5` |
+| LM Studio, llama.cpp, vLLM, OpenAI, Hermes… | their `/v1` URL, key if any, and model name |
+
+The model needs tool calling. Where the server doesn't support structured output, FRIDAY asks for plain
+JSON and checks it. `friday config unset FRIDAY_LLM_URL` goes back to Claude. `friday doctor` checks the brain.
 
 **Laptop speakers instead of headphones?** Run `friday --no-barge-in`, or FRIDAY may hear itself and stop.
 
@@ -94,6 +104,9 @@ from outside your home network; never expose port 8080 to the internet.
 | `friday memory [query]` | What it knows about you, or a search |
 | `friday forget "…"` | Delete facts containing that text |
 | `friday devices` | List mics and speakers |
+| `friday graph [thing] [--format text\|mermaid\|dot\|json]` | The map of your world, or what's around one thing |
+| `friday export [file]` / `friday import <file>` | Save everything to JSON / merge an export, or learn from any notes file |
+| `friday setup` / `friday config [set\|unset NAME VALUE]` / `friday doctor` | First run / settings / health check |
 | `friday login <url> <token>` / `friday logout` | Use a shared hub / go back to this device's own FRIDAY |
 | `friday serve` | Be the hub other devices log in to |
 
@@ -122,12 +135,47 @@ history, so it only reads the latest user message; the client's system prompt an
   answer is kept as a preference, and topics you name become interests for Hacker News. Push back on
   questions and it asks less.
 
+## The graph
+
+FRIDAY keeps a map of how the things in your life connect: you work on a project, the project uses a tool,
+a topic matters for it, a place you go, an org you work with. It adds links when you mention them, and
+from the day's conversation every night. People appear only in how they relate to your work and interests;
+it never maps health, money, family or relationships. Ask "what's connected to FRIDAY?" or:
+
+```bash
+friday graph FRIDAY --depth 2
+```
+
+```bash
+friday graph --format mermaid > world.mmd
+```
+
+## Your data
+
+```bash
+friday export
+```
+
+This writes everything FRIDAY knows (facts, day summaries, reminders, routines, the graph, its skills, what
+it learned about interrupting you) to `friday-export-DATE.json`, readable only by you. Add `--transcripts`
+to include kept raw speech.
+
+```bash
+friday import friday-export-20261103.json
+```
+
+This merges an export into this FRIDAY (another machine, a new install). Nothing already here is
+overwritten, except skills with the same name. Give `import` any other text file (notes, a bio, an
+exported chat history) and FRIDAY reads it and keeps the facts, reminders and links that matter.
+
 ## What it keeps
 
 - **Raw speech:** deleted after the nightly pass (3:00) unless it scored as worth keeping (commitments,
   dates, preferences). Other people's words are always deleted then. Audio is never stored.
 - **Facts about you:** kept, shown in `/api/memory`. Say "Friday, forget that I …" to delete one.
 - **Skills:** `~/.friday/skills/`, plain Markdown you can read and edit.
+- **How you sounded:** when SenseVoice hears a tone (frustrated, happy…) or a laugh, it's noted with that
+  line, so the nightly pass can notice patterns. Audio itself is never kept.
 
 ## Plugins
 
@@ -192,5 +240,8 @@ sensor:
 | `POST /api/presence` | Room radars |
 | `GET /api/hud` | Plugins, situation, learned scores, skills, routines, recent speech |
 | `GET /api/memory?q=` | What FRIDAY knows about you |
+| `GET /api/graph?entity=&depth=` | The graph |
+| `GET /api/export`, `POST /api/import`, `POST /api/learn` | Export, merge an export, learn from text |
+| `GET /api/doctor` | Brain, speech and plugin health |
 
 Keep port 8080 on your LAN or Tailscale. It holds your life.

@@ -80,7 +80,8 @@ class OpenAICompat:
     def __init__(self, base_url, key, model, http=None):
         import httpx
         self.url, self.model = base_url.rstrip("/") + "/chat/completions", model
-        self.http = http or httpx.AsyncClient(timeout=300)
+        # A model on this machine (Ollama, LM Studio…) is never reached through a network proxy.
+        self.http = http or httpx.AsyncClient(timeout=300, trust_env=not is_local(base_url))
         self.headers = {"Authorization": f"Bearer {key}"} if key else {}
 
     async def _post(self, body):
@@ -96,6 +97,10 @@ class OpenAICompat:
         if r.status_code == 429:
             await r.aclose()
             raise Unavailable("The model service is rate-limiting me. Try me again in a minute.")
+        if r.status_code >= 500 or (body.get("stream") and r.status_code >= 400):
+            await r.aclose()
+            raise Unavailable(f"The model service at {self.url.split('/')[2]} isn't answering properly "
+                              f"(HTTP {r.status_code}).")
         return r
 
     async def chat(self, system, messages, tools=(), effort="low", max_tokens=4000, on_text=None):
@@ -158,6 +163,11 @@ class OpenAICompat:
             return schema.model_validate_json(m.group(0)) if m else None
         except pydantic.ValidationError:
             return None
+
+
+def is_local(url):
+    from urllib.parse import urlparse
+    return urlparse(url).hostname in ("localhost", "127.0.0.1", "::1")
 
 
 def _args(raw):

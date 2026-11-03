@@ -15,18 +15,18 @@ flowchart TB
 
     subgraph SERVER["FRIDAY engine (same process, or a shared hub)"]
         stt["SenseVoice<br/>speech → text + how it sounded"]
-        tts["Piper<br/>text → speech"]
+        tts["Piper voice (sherpa-onnx)<br/>text → speech"]
         hear["hear()<br/>score + remember every line"]
         who{"Meant for FRIDAY?<br/>wake word · 10 s follow-up<br/>alone + sounds like a request → Claude decides (typed)<br/>other voice → never"}
 
         subgraph BRAIN["Brain"]
             prefix["Cached prefix<br/>persona + skill index + tools"]
             ctx["Per-turn [context]<br/>time · situation · last 5 min overheard<br/>8 facts · 4 memories"]
-            claude(["Claude, streaming<br/>each sentence spoken as written"])
+            claude(["Claude or any OpenAI-compatible API<br/>streaming: each sentence spoken as written"])
             tools["Tools<br/>remember · forget · recall · reminders<br/>routines · skill_view · skill_save<br/>+ plugin tools"]
         end
 
-        mem[("Memory (SQLite)<br/>facts · interests · day summaries<br/>reminders · routines · questions")]
+        mem[("Memory (SQLite)<br/>facts · interests · day summaries<br/>reminders · routines · questions<br/>graph: entities + links")]
         skills[("Skills<br/>SKILL.md")]
 
         subgraph PRO["Proactive loop (every minute)"]

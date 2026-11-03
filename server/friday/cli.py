@@ -86,10 +86,10 @@ def start_here(background, host="127.0.0.1", port=0):
     for skill in (config.PACKAGE / "starter_skills").iterdir():  # starters; never overwrite FRIDAY's own edits
         if not os.path.exists(os.path.join(s.skills_dir, skill.name)):
             shutil.copytree(skill, os.path.join(s.skills_dir, skill.name))
-    voice = Voice(piper_path=s.voice_path, models_dir=s.models_dir)
+    voice = Voice(s.voice, s.models_dir)
     if not voice.available():
         print(f"{DIM}Getting FRIDAY's ears and voice ready (one-time download, about 300 MB)…{OFF}", flush=True)
-        if not voice.ensure(s.voice):
+        if not voice.ensure():
             print(f"{YELLOW}Couldn't download the voice; FRIDAY will answer in text.{OFF}")
     if not port:
         with socket.socket() as sock:
@@ -106,7 +106,9 @@ def start_here(background, host="127.0.0.1", port=0):
 def client(background=False):
     target = login_settings() or start_here(background)
     url, token = target
-    return httpx.Client(base_url=url, timeout=300, headers={"Authorization": f"Bearer {token}"})
+    from .llm import is_local
+    return httpx.Client(base_url=url, timeout=300, headers={"Authorization": f"Bearer {token}"},
+                        trust_env=not is_local(url))  # a FRIDAY on this machine never goes through a proxy
 
 
 def cmd_login(a):
@@ -231,15 +233,20 @@ def printer():
     return out
 
 
+def ws_connect(c, **kw):
+    """Live connection to FRIDAY. A FRIDAY on this machine is never reached through a network proxy."""
+    import websockets
+    local = c.base_url.host in ("localhost", "127.0.0.1", "::1")
+    return websockets.connect(ws_url(c), **({"proxy": None} if local else {}), **kw)
+
+
 def ws_url(c):
     return str(c.base_url).replace("http", "ws", 1).rstrip("/") + "/ws?token=" + c.headers["authorization"][7:]
 
 
 def cmd_watch(c, a):
-    import websockets
-
     async def run():
-        async with websockets.connect(ws_url(c)) as ws:
+        async with ws_connect(c) as ws:
             print(f"{DIM}Watching FRIDAY. Ctrl-C to stop.{OFF}")
             out = printer()
             async for raw in ws:
@@ -370,7 +377,6 @@ def cmd_listen(c, a):
 
     import numpy as np
     import webrtcvad
-    import websockets
 
     sd = sound()
     vad, strict = webrtcvad.Vad(a.vad), webrtcvad.Vad(3)  # stricter while FRIDAY talks: ignore leakage
@@ -397,7 +403,7 @@ def cmd_listen(c, a):
                 x = np.interp(np.linspace(0, len(x) - 1, FRAME), np.arange(len(x)), x).astype(np.int16)
             loop.call_soon_threadsafe(frames.put_nowait, x.tobytes())
 
-        async with websockets.connect(ws_url(c), max_size=2 ** 24) as ws:
+        async with ws_connect(c, max_size=2 ** 24) as ws:
             await ws.send(json.dumps({"type": "hello", "voice": True}))
 
             async def hear():
@@ -589,6 +595,7 @@ def cmd_config(a):
 def cmd_setup(a):
     import getpass
     import shutil
+    secret = getpass.getpass if sys.stdin.isatty() else input  # scripted setups pipe answers in
     print(f"{BOLD}Let's set FRIDAY up.{OFF} Everything stays on this machine, in {HOME}.\n")
     name = input("What should FRIDAY call you? ").strip()
     if name:
@@ -600,7 +607,7 @@ def cmd_setup(a):
     choice = input("Pick one [1]: ").strip() or "1"
     if choice == "2":
         url = input("Base URL [http://localhost:11434/v1]: ").strip() or "http://localhost:11434/v1"
-        key = getpass.getpass("API key (Enter if none): ").strip()
+        key = secret("API key (Enter if none): ").strip()
         model = ""
         while not model:
             model = input("Model name (e.g. llama3.3, anthropic/claude-opus-5.5): ").strip()
@@ -611,7 +618,7 @@ def cmd_setup(a):
             import subprocess
             subprocess.run(["ant", "auth", "login"], check=False)
         else:
-            key = getpass.getpass("Anthropic API key: ").strip()
+            key = secret("Anthropic API key: ").strip()
             if key:
                 set_env("ANTHROPIC_API_KEY", key)
     print()
@@ -634,7 +641,7 @@ def cmd_doctor(c, a):
     print(f"  {ok} Plugins: {', '.join(d['plugins']) or 'none'}")
     for err in d["plugin_errors"]:
         print(f"  {bad} {err}")
-    print(f"  {ok} {'Shared hub: ' + str(c.base_url) if saved().get('url') else 'Running on this device'}")
+    print(f"  {ok} {'Talking to the FRIDAY at ' + str(c.base_url) if login_settings() else 'Running on this device'}")
 
 
 def main(argv=None):
