@@ -1,5 +1,5 @@
+.venv/
 __pycache__/
-*.db
-.env
-node_modules/
-glasses/dist/
+*.egg-info/
+.pytest_cache/
+dist/
