@@ -1,8 +1,10 @@
 pub mod agent;
 pub mod bus;
 pub mod cactus;
+pub mod checkpoint;
 pub mod coin;
 pub mod config;
+pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod operate;
@@ -11,6 +13,17 @@ pub mod skills;
 pub mod system1;
 pub mod tools;
 pub mod ui;
+
+static INTERRUPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ctrl-C during a turn sets this; the loop, the model stream and running commands stop at it.
+pub fn interrupted() -> bool {
+    INTERRUPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_interrupted(on: bool) {
+    INTERRUPT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// The HTTP agent for `url`: through the environment's proxy, unless NO_PROXY exempts the host.
 /// ureq ignores NO_PROXY on its own, which would send a local model server's traffic to the proxy.

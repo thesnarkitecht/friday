@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 
-const CHUNK: usize = 1800; // characters per drawer
+const CHUNK: usize = 1000; // characters per drawer: what MiniLM embeds whole (256 tokens)
 const DERIVE_BATCH: i64 = 6; // without Jev, derive once this many messages are waiting
 const DREAM_EVERY: i64 = 12; // rebuild a peer card after this many new conclusions
 
@@ -44,6 +44,7 @@ pub struct Memory {
     s1: Arc<S1>,
     db: Mutex<Connection>,
     embed: Embedder,
+    vectors: Mutex<HashMap<String, Vec<f32>>>,
     jobs: Mutex<Sender<Job>>,
     pub errors: Mutex<HashMap<&'static str, String>>,
 }
@@ -68,7 +69,7 @@ fn from_blob(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let (dot, na, nb) = a.iter().zip(b).fold((0f32, 0f32, 0f32), |(d, x, y), (p, q)| (d + p * q, x + p * p, y + q * q));
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
 }
@@ -132,7 +133,7 @@ impl Memory {
              CREATE TABLE IF NOT EXISTS pending(id INTEGER PRIMARY KEY, peer TEXT NOT NULL, content TEXT NOT NULL);",
         )?;
         let (jobs, inbox) = channel();
-        let memory = Arc::new(Memory { cfg: cfg.clone(), s1, db: Mutex::new(db), embed, jobs: Mutex::new(jobs), errors: Mutex::default() });
+        let memory = Arc::new(Memory { cfg: cfg.clone(), s1, db: Mutex::new(db), embed, vectors: Mutex::default(), jobs: Mutex::new(jobs), errors: Mutex::default() });
         let worker = memory.clone();
         std::thread::spawn(move || {
             for job in inbox {
@@ -156,6 +157,27 @@ impl Memory {
         if let Err(e) = result {
             self.errors.lock().unwrap().insert(part, format!("{e:#}"));
         }
+    }
+
+    /// An embedding for `text`, cached for the life of the process (skill descriptions repeat every turn).
+    pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        if let Some(v) = self.vectors.lock().unwrap().get(text) {
+            return Some(v.clone());
+        }
+        let v = (self.embed)(text)?;
+        let mut cache = self.vectors.lock().unwrap();
+        if cache.len() > 4096 {
+            cache.clear(); // bounded: a long-running watcher must not grow forever
+        }
+        cache.insert(text.to_string(), v.clone());
+        Some(v)
+    }
+
+    /// Load the embedding model in the background (a download on first ever run) so the first
+    /// turn doesn't wait on it.
+    pub fn warm_up(self: &Arc<Self>) {
+        let me = self.clone();
+        std::thread::spawn(move || drop((me.embed)("warm up")));
     }
 
     /// Store `text` verbatim, attributed to `speaker`. Returns at once; the work is queued.

@@ -120,6 +120,9 @@ fn perform(env: &mut dyn Env, name: &str, args: &Value) -> Result<()> {
 pub fn operate(agent: &Agent, env: &mut dyn Env, goal: &str) -> Result<String> {
     let (mut history, mut answer, mut last): (Vec<String>, String, Option<Step>) = (Vec::new(), String::new(), None);
     for _ in 0..MAX_STEPS {
+        if crate::interrupted() {
+            break;
+        }
         let (labels, text) = env.observe()?;
         // System 2 takes the step when System 1 is unsure, or is about to repeat itself.
         let (step, who) = match s1_step(agent, goal, &labels, &text, &history).filter(|s| Some(s) != last.as_ref()) {

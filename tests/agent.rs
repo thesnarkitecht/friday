@@ -1,185 +1,15 @@
 //! End-to-end tests. System 2 and Jev are fake servers on localhost reached through the real
 //! HTTP code; Needle is swapped for a scripted reply. The live models have their own tests.
 
-use friday::agent::{Agent, Shared, Ui};
+mod common;
+use common::*;
 use friday::config::{Config, ModelSpec, Watch};
 use friday::operate::{elements, operate, Env};
 use friday::system1::S1;
-use friday::{bus::Bus, coin, memory::Memory, proactive, skills, tools};
+use friday::{bus::Bus, coin, proactive, skills, tools};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-
-type ChatFn = Box<dyn FnMut(&Value) -> Option<Value> + Send>;
-type JevFn = Box<dyn FnMut(&Value) -> Value + Send>;
-
-struct Fake {
-    url: String,
-    chat: Arc<Mutex<ChatFn>>,
-    jev: Arc<Mutex<JevFn>>,
-    requests: Arc<Mutex<Vec<Value>>>,
-}
-
-fn sse(model: &str, reply: &Value) -> String {
-    let chunk = |delta: Value| json!({"id": "x", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": delta}]});
-    let mut chunks = vec![chunk(json!({"role": "assistant", "content": ""}))];
-    for word in reply["content"].as_str().unwrap_or("").split_inclusive(' ') {
-        chunks.push(chunk(json!({"content": word})));
-    }
-    for (i, call) in reply["calls"].as_array().into_iter().flatten().enumerate() {
-        let f = json!({"name": call[0], "arguments": call[1].to_string()});
-        chunks.push(chunk(json!({"tool_calls": [{"index": i, "id": format!("call_{i}"), "type": "function", "function": f}]})));
-    }
-    chunks.push(json!({"id": "x", "choices": [], "usage": {"prompt_tokens": reply["tokens"].as_u64().unwrap_or(10)}}));
-    chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n"
-}
-
-impl Fake {
-    fn start() -> Fake {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let url = format!("http://127.0.0.1:{}", server.server_addr().to_ip().unwrap().port());
-        let fake = Fake { url, chat: Arc::new(Mutex::new(Box::new(|_| None))), jev: Arc::new(Mutex::new(jev(&[]))), requests: Arc::default() };
-        let (chat, jev, requests) = (fake.chat.clone(), fake.jev.clone(), fake.requests.clone());
-        std::thread::spawn(move || {
-            for mut req in server.incoming_requests() {
-                let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
-                let body: Value = serde_json::from_str(&body).unwrap_or(json!({}));
-                let response = if req.url().ends_with("/jev") {
-                    let answers = (jev.lock().unwrap())(&body["questions"]);
-                    tiny_http::Response::from_string(json!({"model": "jev-test", "answers": answers, "usage": {}}).to_string())
-                } else {
-                    requests.lock().unwrap().push(body.clone());
-                    match (chat.lock().unwrap())(&body) {
-                        Some(reply) => tiny_http::Response::from_string(sse(body["model"].as_str().unwrap_or(""), &reply)),
-                        None => tiny_http::Response::from_string(r#"{"error": {"message": "boom"}}"#).with_status_code(500),
-                    }
-                };
-                let _ = req.respond(response);
-            }
-        });
-        fake
-    }
-
-    fn script(&self, replies: Vec<Value>) {
-        let mut queue: VecDeque<Value> = replies.into();
-        *self.chat.lock().unwrap() = Box::new(move |_| queue.pop_front());
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-fn say(content: &str, calls: &[(&str, Value)]) -> Value {
-    json!({"content": content, "calls": calls.iter().map(|(n, a)| json!([n, a])).collect::<Vec<_>>()})
-}
-
-/// Jev's wire answer for a decision. Strings are choices, booleans nouls.
-fn wire(value: &Value, confidence: f64, probs: &Value) -> Value {
-    match value {
-        Value::Bool(yes) => json!({"type": "noul", "noul": if *yes { 0.5 + confidence / 2.0 } else { 0.5 - confidence / 2.0 }}),
-        Value::String(s) => json!({"type": "choice", "choice": s, "confidence": confidence, "probabilities": if probs.is_null() { json!({s: confidence}) } else { probs.clone() }}),
-        other => json!({"type": "score", "score": other, "confidence": confidence}),
-    }
-}
-
-/// A Jev that answers the routing questions with sure, minimal answers, plus `extra`.
-/// Questions it has no answer for are left out, as Jev would never do: they get their defaults.
-fn jev(extra: &[(&str, Value, f64)]) -> JevFn {
-    let mut all: HashMap<String, (Value, f64, Value)> = [("tier", json!("main")), ("web", json!(false)), ("desktop", json!(false)), ("agents", json!(false))]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), (v, 0.9, Value::Null)))
-        .collect();
-    for (k, v, c) in extra {
-        all.insert(k.to_string(), (v.clone(), *c, Value::Null));
-    }
-    Box::new(move |questions| {
-        let mut out = serde_json::Map::new();
-        for name in questions.as_object().into_iter().flatten().map(|(k, _)| k) {
-            if let Some((v, c, p)) = all.get(name) {
-                out.insert(name.clone(), wire(v, *c, p));
-            }
-        }
-        Value::Object(out)
-    })
-}
-
-#[derive(Default)]
-struct Rec {
-    lines: Mutex<Vec<String>>,
-    tokens: Mutex<Vec<Option<String>>>,
-}
-
-impl Ui for Rec {
-    fn line(&self, text: &str) {
-        self.lines.lock().unwrap().push(text.into());
-    }
-    fn token(&self, delta: Option<&str>) {
-        self.tokens.lock().unwrap().push(delta.map(String::from));
-    }
-}
-
-impl Rec {
-    fn saw(&self, needle: &str) -> bool {
-        self.lines.lock().unwrap().iter().any(|l| l.contains(needle))
-    }
-}
-
-struct Rig {
-    agent: Agent,
-    ui: Arc<Rec>,
-    dir: tempfile::TempDir,
-}
-
-impl Rig {
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-    fn home(&self) -> PathBuf {
-        self.agent.shared.cfg.home.clone()
-    }
-    fn finish(&mut self) {
-        if let Some(learner) = self.agent.learner.take() {
-            learner.join().unwrap();
-        }
-        self.agent.shared.memory.flush();
-    }
-}
-
-fn rig(fake: &Fake, needle: Value, yolo: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let mut cfg = Config { user: "ryan".into(), skill_dirs: vec![home.join("skills")], home, ..Default::default() };
-    for tier in ["fast", "main", "deep"] {
-        cfg.models.insert(tier.into(), ModelSpec { model: format!("{tier}-model"), base_url: format!("{}/v1", fake.url), api_key_env: "FRIDAY_TEST_NO_KEY".into() });
-    }
-    cfg.s1.jev_url = format!("{}/jev", fake.url);
-    cfg.s1.jev_key = Some("test".into());
-    tweak(&mut cfg);
-    let mut s1 = S1::new(&cfg);
-    s1.needle = Box::new(move |_, _, _| Ok(needle.clone()));
-    let s1 = Arc::new(s1);
-    let memory = Memory::open(&cfg, s1.clone(), Box::new(|_| None)).unwrap();
-    let bus = Bus::open(&cfg.home).unwrap();
-    let ui = Arc::new(Rec::default());
-    let shared = Arc::new(Shared { cfg, s1, memory, bus, ui: ui.clone(), interactive: false, yolo: AtomicBool::new(yolo), wake: String::new() });
-    Rig { agent: Agent::new(shared, "friday"), ui, dir }
-}
-
-fn no_needle() -> Value {
-    json!({"function_calls": [], "confidence": 0.0})
-}
-
-fn needle_says(name: &str, args: Value, confidence: f64) -> Value {
-    json!({"function_calls": [{"name": name, "arguments": args}], "confidence": confidence})
-}
-
-fn offered(request: &Value) -> Vec<String> {
-    request["tools"].as_array().into_iter().flatten().filter_map(|t| t["function"]["name"].as_str().map(String::from)).collect()
-}
 
 // -- the loop ---------------------------------------------------------------------------------
 
@@ -275,8 +105,8 @@ fn writes_are_denied_without_approval() {
 
 #[test]
 fn the_read_only_allowlist_rejects_chained_commands() {
-    assert!(tools::is_read_only("ls -la") && tools::is_read_only("rg TODO src"));
-    for sneaky in ["ls; rm -rf x", "cat a > b", "ls && rm x", "cat `rm x`", "rm x", "ls $(rm x)", "ls\nrm x", "find . -delete | ls"] {
+    assert!(tools::is_read_only("ls -la") && tools::is_read_only("grep -rn TODO src"));
+    for sneaky in ["find . -delete", "find . -exec rm {} +", "rg --pre ./x y", "tree -o f", "date -s 2020-01-01", "ls; rm -rf x", "cat a > b", "ls && rm x", "cat `rm x`", "rm x", "ls $(rm x)", "ls\nrm x", "find . -delete | ls"] {
         assert!(!tools::is_read_only(sneaky), "{sneaky}");
     }
 }
@@ -461,7 +291,7 @@ fn multi_step_work_becomes_a_skill_and_a_lone_call_trains_needle() {
 fn chunks_join_back_to_the_exact_original() {
     let text = format!("short line\n{}\n{}\n", "x".repeat(5000), "é".repeat(2000));
     let pieces = friday::memory::chunks(&text);
-    assert!(pieces.len() > 3 && pieces.iter().all(|p| p.chars().count() <= 1800));
+    assert!(pieces.len() > 3 && pieces.iter().all(|p| p.chars().count() <= 1000));
     assert_eq!(pieces.concat(), text);
 }
 
@@ -676,4 +506,289 @@ fn friday_run_prints_only_the_answer_on_stdout() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("plan → main"));
+}
+
+
+#[test]
+fn a_hung_command_times_out_and_keeps_its_output() {
+    let started = std::time::Instant::now();
+    let out = tools::run_command("echo before; sleep 30", std::time::Duration::from_millis(500)).unwrap();
+    assert!(started.elapsed().as_secs() < 5);
+    assert!(out.starts_with("stopped: timed out") && out.contains("before"), "{out}");
+    let ok = tools::run_command("echo out; echo err >&2; exit 3", std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(ok, "exit 3\nout\nerr\n");
+}
+
+#[test]
+fn a_provider_error_mid_stream_is_an_error_not_an_empty_answer() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/v1", server.server_addr().to_ip().unwrap().port());
+    std::thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let _ = req.respond(tiny_http::Response::from_string("data: {\"error\": {\"message\": \"rate limited\"}}\n\ndata: [DONE]\n\n"));
+        }
+    });
+    let mut cfg = Config::default();
+    cfg.models.insert("main".into(), ModelSpec { model: "m".into(), base_url: url, api_key_env: "X".into() });
+    let err = friday::models::chat(&cfg, "main", &[json!({"role": "user", "content": "hi"})], &[], None).unwrap_err();
+    assert!(err.to_string().contains("rate limited"), "{err}");
+}
+
+#[test]
+fn tool_calls_without_index_or_id_still_come_out_whole() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/v1", server.server_addr().to_ip().unwrap().port());
+    std::thread::spawn(move || {
+        let body = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"b","function":{"name":"pwd","arguments":"{"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"}"}}]}}]}"#,
+        ]
+        .iter()
+        .map(|c| format!("data: {c}\n\n"))
+        .collect::<String>();
+        for req in server.incoming_requests() {
+            let _ = req.respond(tiny_http::Response::from_string(body.clone()));
+        }
+    });
+    let mut cfg = Config::default();
+    cfg.models.insert("main".into(), ModelSpec { model: "m".into(), base_url: url, api_key_env: "X".into() });
+    let reply = friday::models::chat(&cfg, "main", &[json!({"role": "user", "content": "hi"})], &[], None).unwrap();
+    let calls: Vec<(&str, &str, &str)> = reply.tool_calls.iter().map(|c| (c.id.as_str(), c.name.as_str(), c.arguments.as_str())).collect();
+    assert_eq!(calls, [("call_0", "ls", "{}"), ("b", "pwd", "{}")]);
+    assert!(reply.prompt_tokens > 0, "no usage reported: estimated");
+}
+
+// -- skills, continued ------------------------------------------------------------------------
+
+#[test]
+fn a_large_library_is_shortlisted_before_jev_sees_it() {
+    let fake = Fake::start();
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = asked.clone();
+    let mut routing = jev(&[]);
+    *fake.jev.lock().unwrap() = Box::new(move |q| {
+        if let Some(c) = q["skills"]["criteria"].as_object() {
+            *seen.lock().unwrap() = c.keys().cloned().collect();
+        }
+        routing(q)
+    });
+    fake.script(vec![say("ok", &[])]);
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    for i in 0..60 {
+        write_skill(&r.home(), &format!("filler-{i}"), &format!("unrelated chore number {i}"));
+    }
+    write_skill(&r.home(), "postgres-migrations", "write and run postgres schema migrations safely");
+    r.agent.turn("write a postgres migration that adds an index");
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 25, "24 shortlisted plus `none`");
+    assert!(asked.contains(&"postgres-migrations".to_string()));
+    r.finish();
+}
+
+#[test]
+fn a_named_skill_is_followed_with_its_supporting_files() {
+    let fake = Fake::start();
+    fake.script(vec![say("released", &[])]);
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    write_skill(&r.home(), "release", "cut a release");
+    let scripts = r.home().join("skills/release/scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("bump.sh"), "echo bump").unwrap();
+    r.agent.force_skills = vec!["release".into()];
+    r.agent.turn("go");
+    let system = fake.requests()[0]["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("Steps for release.") && system.contains("scripts/bump.sh"), "{system}");
+    assert!(r.ui.saw("skills: release"));
+    r.finish();
+}
+
+#[test]
+fn rewriting_a_skill_keeps_the_old_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config { home: dir.path().into(), skill_dirs: vec![dir.path().join("skills")], ..Default::default() };
+    skills::save(&cfg, "---\nname: deploy\ndescription: v1\n---\nold steps").unwrap();
+    skills::save(&cfg, "---\nname: deploy\ndescription: v2\n---\nnew steps").unwrap();
+    assert_eq!(skills::load(&cfg)["deploy"].description, "v2");
+    let history: Vec<_> = std::fs::read_dir(dir.path().join("skills/deploy/history")).unwrap().flatten().collect();
+    assert_eq!(history.len(), 1);
+    assert!(std::fs::read_to_string(history[0].path()).unwrap().contains("old steps"));
+    assert_eq!(skills::load(&cfg).len(), 1, "history is not loaded as skills");
+}
+
+#[test]
+fn a_skill_that_gets_retired_is_rewritten_from_the_failure() {
+    let fake = Fake::start();
+    // Sure it applies, sure the work should not become a skill: only self-healing can rewrite it.
+    let mut routing = jev(&[("learn", json!("no"), 0.95), ("ok", json!(false), 0.9), ("tier", json!("deep"), 0.9)]);
+    *fake.jev.lock().unwrap() = Box::new(move |q| {
+        let mut out = routing(q);
+        if q.get("skills").is_some() {
+            out["skills"] = wire(&json!("flaky"), 0.9, &Value::Null);
+        }
+        out
+    });
+    fake.script(vec![say("half", &[]), say("---\nname: flaky\ndescription: fixed\n---\nbetter steps\n", &[])]);
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    write_skill(&r.home(), "flaky", "does the thing");
+    let cfg = r.agent.shared.cfg.clone();
+    for _ in 0..3 {
+        skills::record(&cfg, &["flaky".into()], false).unwrap();
+    }
+    r.agent.turn("do the thing"); // 4th loss: retired, then rewritten
+    r.finish();
+    assert!(r.ui.saw("improved skill: flaky"));
+    assert_eq!(skills::load(&cfg)["flaky"].description, "fixed");
+    assert!(skills::healthy(skills::scores(&cfg).get("flaky")), "a rewrite starts with a clean record");
+}
+
+#[test]
+fn the_agent_can_read_and_write_skills_mid_task() {
+    let fake = Fake::start();
+    fake.script(vec![
+        say("", &[("skill_view", json!({"name": "lint"})), ("skill_save", json!({"content": "---\nname: fmt-check\ndescription: check formatting\n---\nrun the formatter"}))]),
+        say("done", &[]),
+    ]);
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    write_skill(&r.home(), "lint", "run the linter");
+    r.agent.turn("x");
+    let results: Vec<String> = r.agent.messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert!(results[0].contains("Steps for lint.") && results[1] == "saved skill `fmt-check`");
+    assert!(skills::load(&r.agent.shared.cfg).contains_key("fmt-check"));
+    r.finish();
+}
+
+#[test]
+fn a_skill_pack_installs_from_git() {
+    let src = tempfile::tempdir().unwrap();
+    let pack = src.path().join("my-pack");
+    for name in ["one", "two"] {
+        std::fs::create_dir_all(pack.join(name)).unwrap();
+        std::fs::write(pack.join(name).join("SKILL.md"), format!("---\nname: {name}\ndescription: d\n---\n")).unwrap();
+    }
+    let git = |args: &[&str]| assert!(std::process::Command::new("git").args(args).current_dir(&pack).output().unwrap().status.success());
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pack"]);
+    let home = tempfile::tempdir().unwrap();
+    let cfg = Config { home: home.path().into(), skill_dirs: vec![home.path().join("skills")], ..Default::default() };
+    assert_eq!(skills::add(&cfg, pack.to_str().unwrap()).unwrap(), ("my-pack".into(), 2));
+    assert!(skills::load(&cfg).contains_key("two"));
+    assert!(skills::add(&cfg, pack.to_str().unwrap()).is_err(), "never overwrites");
+}
+
+#[test]
+fn project_skills_load_only_from_trusted_folders() {
+    let home = tempfile::tempdir().unwrap();
+    let project = std::path::Path::new("/some/cloned/repo");
+    assert!(!friday::config::is_trusted(home.path(), project));
+    friday::config::trust(home.path(), project).unwrap();
+    assert!(friday::config::is_trusted(home.path(), project));
+    assert!(!friday::config::is_trusted(home.path(), std::path::Path::new("/some/cloned")));
+}
+
+// -- harness: MCP, checkpoints, tools ---------------------------------------------------------
+
+fn echo_server(trust: bool) -> friday::mcp::Server {
+    let cfg = friday::mcp::McpConfig {
+        name: "demo".into(),
+        command: "python3".into(),
+        args: vec![format!("{}/tests/fixtures/mcp_echo.py", env!("CARGO_MANIFEST_DIR"))],
+        env: Default::default(),
+        trust,
+    };
+    friday::mcp::Server::start(&cfg).expect("python3 runs the test MCP server")
+}
+
+#[test]
+fn mcp_tools_load_only_when_jev_says_the_server_is_needed() {
+    let fake = Fake::start();
+    *fake.jev.lock().unwrap() = jev(&[("mcp:demo", json!(false), 0.9)]);
+    fake.script(vec![say("no tools needed", &[])]);
+    let mut r = rig_with(&fake, no_needle(), true, |_| {}, vec![echo_server(true)]);
+    r.agent.turn("hello");
+    assert!(!offered(&fake.requests()[0]).iter().any(|t| t.starts_with("mcp__")));
+    r.finish();
+
+    *fake.jev.lock().unwrap() = jev(&[("mcp:demo", json!(true), 0.9)]);
+    fake.script(vec![say("", &[("mcp__demo__echo", json!({"text": "hi"})), ("mcp__demo__echo", json!({"text": "fail"}))]), say("done", &[])]);
+    r.agent.turn("echo hi");
+    assert!(offered(&fake.requests()[1]).contains(&"mcp__demo__echo".to_string()));
+    let results: Vec<String> = r.agent.messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(results, ["echo: hi", "error: echo: fail"]);
+    r.finish();
+}
+
+#[test]
+fn an_untrusted_mcp_tool_asks_first() {
+    let fake = Fake::start();
+    *fake.jev.lock().unwrap() = jev(&[("mcp:demo", json!(true), 0.9)]);
+    fake.script(vec![say("", &[("mcp__demo__echo", json!({"text": "hi"}))]), say("ok", &[])]);
+    let mut r = rig_with(&fake, no_needle(), false, |_| {}, vec![echo_server(false)]);
+    r.agent.turn("echo hi");
+    let result = r.agent.messages.iter().find(|m| m["role"] == "tool").unwrap()["content"].clone();
+    assert_eq!(result, tools::DENIED);
+    r.finish();
+}
+
+#[test]
+fn undo_restores_changed_and_deleted_files_and_removes_new_ones() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let w = work.path();
+    std::fs::write(w.join("keep.txt"), "original").unwrap();
+    std::fs::write(w.join("gone.txt"), "will be deleted").unwrap();
+    std::fs::create_dir_all(w.join("node_modules")).unwrap();
+    std::fs::write(w.join("node_modules/big.js"), "x").unwrap();
+    assert!(friday::checkpoint::snapshot(home.path(), w, "before").unwrap().is_some());
+    std::fs::write(w.join("keep.txt"), "clobbered").unwrap();
+    std::fs::remove_file(w.join("gone.txt")).unwrap();
+    std::fs::write(w.join("new.txt"), "made by the agent").unwrap();
+    let summary = friday::checkpoint::undo(home.path(), w).unwrap();
+    assert_eq!(std::fs::read_to_string(w.join("keep.txt")).unwrap(), "original");
+    assert_eq!(std::fs::read_to_string(w.join("gone.txt")).unwrap(), "will be deleted");
+    assert!(!w.join("new.txt").exists());
+    assert!(w.join("node_modules/big.js").exists(), "excluded folders are left alone");
+    assert_eq!(summary, "restored 2 file(s), removed 1 new file(s)");
+    assert!(friday::checkpoint::undo(home.path(), w).is_err(), "nothing left to undo");
+}
+
+#[test]
+fn a_turn_that_changes_files_checkpoints_once_first() {
+    let fake = Fake::start();
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    let file = std::env::current_dir().unwrap().join("target/checkpoint-probe.txt");
+    fake.script(vec![say("", &[("write_file", json!({"path": file, "content": "a"})), ("write_file", json!({"path": file, "content": "b"}))]), say("ok", &[])]);
+    r.agent.turn("write twice");
+    let store = std::fs::read_dir(r.home().join("checkpoints")).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(std::fs::read_to_string(store.join("friday-undo")).unwrap().lines().count(), 1, "one checkpoint per turn");
+    let _ = std::fs::remove_file(file);
+    r.finish();
+}
+
+#[test]
+fn todo_ask_user_and_fetch_url_work() {
+    let page = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/", page.server_addr().to_ip().unwrap().port());
+    std::thread::spawn(move || {
+        for req in page.incoming_requests() {
+            let html = "<html><head><style>p{}</style><script>evil()</script></head><body><h1>Docs</h1><p>Use &lt;b&gt; &amp; more</p></body></html>";
+            let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap();
+            let _ = req.respond(tiny_http::Response::from_string(html).with_header(header));
+        }
+    });
+    let fake = Fake::start();
+    *fake.jev.lock().unwrap() = jev(&[("web", json!(true), 0.9)]);
+    fake.script(vec![
+        say("", &[("todo", json!({"items": ["[x] read docs", "write code"]})), ("ask_user", json!({"question": "which db?"})), ("fetch_url", json!({"url": url}))]),
+        say("ok", &[]),
+    ]);
+    let mut r = rig(&fake, no_needle(), true, |_| {});
+    r.agent.turn("x");
+    let results: Vec<String> = r.agent.messages.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap().to_string()).collect();
+    assert_eq!(results[0], "[x] read docs\nwrite code");
+    assert!(results[1].starts_with("Nobody is here to answer"));
+    assert!(results[2].ends_with("Docs Use <b> & more") && !results[2].contains("evil"), "{}", results[2]);
+    assert!(r.ui.saw("1/2 done"));
+    r.finish();
 }

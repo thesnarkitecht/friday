@@ -145,7 +145,9 @@ impl Screen {
             s.streamed.clear();
             resume(&mut s);
         }
+        crate::set_interrupted(false);
         let reply = agent.turn(text);
+        crate::set_interrupted(false);
         if let Some(learner) = agent.learner.take() {
             let _ = learner.join(); // so a "learned skill" line lands before the prompt returns
         }
@@ -177,17 +179,25 @@ impl Ui for Plain {
     fn line(&self, text: &str) {
         eprintln!("{text}");
     }
+
+    fn ask(&self, prompt: &str) -> String {
+        eprint!("{prompt}");
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        answer
+    }
 }
 
 // -- the conversation -------------------------------------------------------------------------
 
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 8] = [
     ("/help", "show this"),
     ("/tier", "pin a model tier: /tier fast|main|deep, or /tier auto to let System 1 choose"),
     ("/skills", "list skills and how they have performed"),
     ("/stats", "how much of this session System 1 handled"),
     ("/yolo", "toggle approval prompts"),
     ("/clear", "start a fresh conversation (memory is kept)"),
+    ("/undo", "put files back as they were before Friday's last change"),
     ("/exit", "leave"),
 ];
 
@@ -238,18 +248,25 @@ fn banner(agent: &Agent) -> Vec<String> {
     ]
 }
 
+/// A yes/no question; anything but y is no.
+pub fn confirm(question: &str) -> bool {
+    prompt(&format!("  \x1b[33m{question} [y/N]\x1b[0m ")).eq_ignore_ascii_case("y")
+}
+
 pub fn show_skills(cfg: &Config) {
     let (all, marks) = (skills::load(cfg), skills::scores(cfg));
     if all.is_empty() {
         return println!("{DIM}  no skills yet; Friday writes them as it works{OFF}");
     }
-    println!("{DIM}  {:28} {:>4} {:>4}  when{OFF}", "skill", "used", "won");
+    println!("{DIM}  {:28} {:8} {:>9}  when{OFF}", "skill", "from", "record");
     for (name, skill) in all {
         let (uses, wins) = marks.get(&name).copied().unwrap_or_default();
+        let record = if uses == 0 { "—".to_string() } else { format!("{wins}/{uses}") };
         let state = if skills::healthy(marks.get(&name)) { "" } else { "\x1b[31mretired\x1b[0m " };
-        let when: String = skill.description.chars().take(64).collect();
-        println!("  {ACCENT}{name:28}{OFF} {uses:>4} {wins:>4}  {state}{DIM}{when}{OFF}");
+        let when: String = skill.description.chars().take(60).collect();
+        println!("  {ACCENT}{name:28}{OFF} {DIM}{:8}{OFF} {record:>9}  {state}{DIM}{when}{OFF}", skill.origin());
     }
+    println!("{DIM}  /<skill> runs a turn with that skill · friday skills add <git-url> installs a pack{OFF}");
 }
 
 fn show_stats(agent: &Agent) {
@@ -265,6 +282,24 @@ fn show_stats(agent: &Agent) {
     if !error.is_empty() {
         println!("  \x1b[33msystem 1\x1b[0m: {error}");
     }
+}
+
+fn session_path(agent: &Agent) -> std::path::PathBuf {
+    agent.shared.cfg.home.join("sessions").join(format!("{}.json", agent.name))
+}
+
+/// The conversation so far, so `friday --continue` can pick it up.
+fn save_session(agent: &Agent) {
+    let path = session_path(agent);
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let _ = std::fs::write(path.with_extension("tmp"), serde_json::to_string(&agent.messages).unwrap_or_default());
+    let _ = std::fs::rename(path.with_extension("tmp"), path);
+}
+
+pub fn load_session(agent: &Agent) -> Vec<Value> {
+    let messages: Vec<Value> = std::fs::read_to_string(session_path(agent)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    println!("{DIM}  continuing: {} earlier messages{OFF}", messages.len());
+    messages
 }
 
 pub fn chat_loop(agent: &mut Agent, screen: &Screen, animate: bool) -> Result<()> {
@@ -300,9 +335,19 @@ pub fn chat_loop(agent: &mut Agent, screen: &Screen, animate: bool) -> Result<()
                 println!("{DIM}  approvals {}{OFF}", if on { "off" } else { "on" });
             }
             "/clear" => agent.messages.clear(),
-            _ if command.starts_with('/') => println!("{DIM}  unknown command; /help lists them{OFF}"),
+            "/undo" => match crate::checkpoint::undo(&agent.shared.cfg.home, &std::env::current_dir().unwrap_or_default()) {
+                Ok(summary) => println!("{DIM}  {summary}{OFF}"),
+                Err(e) => println!("{DIM}  {e:#}{OFF}"),
+            },
+            _ if command.starts_with('/') && skills::load(&agent.shared.cfg).contains_key(&command[1..]) => {
+                agent.force_skills = vec![command[1..].to_string()];
+                let task = if arg.is_empty() { format!("Use the `{}` skill.", &command[1..]) } else { arg.to_string() };
+                screen.turn(agent, &task);
+            }
+            _ if command.starts_with('/') => println!("{DIM}  unknown command; /help lists them, /skills lists skills{OFF}"),
             _ => screen.turn(agent, &text),
         }
+        save_session(agent);
     }
     let _ = editor.save_history(&history);
     Ok(())
