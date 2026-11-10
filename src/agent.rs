@@ -77,6 +77,8 @@ pub struct Agent {
 
 pub struct Plan {
     pub tier: String,
+    /// For a reflex: the one tool Jev chose, so Needle only fills in its arguments.
+    pub tool: Option<String>,
     pub groups: Vec<String>,
     pub skills: Vec<String>,
 }
@@ -142,7 +144,7 @@ impl Agent {
         self.calls.clear();
         self.clean = true;
         self.checkpointed = false;
-        let reflex = if plan.tier == "reflex" { self.reflex(text, &plan.groups) } else { None };
+        let reflex = if plan.tier == "reflex" { self.reflex(text, &plan.groups, plan.tool.as_deref()) } else { None };
         let reflexed = reflex.is_some();
         let reply = reflex.unwrap_or_else(|| {
             let tier = self.force_tier.clone().unwrap_or(if plan.tier == "reflex" { "fast".into() } else { plan.tier.clone() });
@@ -178,7 +180,7 @@ impl Agent {
                 "type": "choice",
                 "instructions": "How much model capability does this request need?",
                 "criteria": {
-                    "reflex": "one direct action that maps to a single tool call, like reading a named file or running a given command",
+                    "reflex": "Needle alone, no LLM: one direct action that is a single tool call, like reading a named file or running a given command",
                     "fast": "small talk, a simple question, or a trivial edit",
                     "main": "multi-step coding, research or automation",
                     "deep": "hard design, subtle debugging, or long-horizon planning"
@@ -189,6 +191,9 @@ impl Agent {
             "desktop": {"type": "noul", "instructions": "Doing this requires controlling this computer's mouse, keyboard and screen."},
             "agents": {"type": "noul", "instructions": "This splits into independent subtasks worth running in parallel, or involves messaging other agents."}
         });
+        // For a reflex, Jev also picks the tool: Needle is far surer filling in one tool than choosing among many.
+        let reflexive: serde_json::Map<String, Value> = tools::all().into_iter().filter(|t| matches!(t.group, "core" | "web")).map(|t| (t.name.to_string(), json!(t.description))).collect();
+        questions["tool"] = json!({"type": "choice", "instructions": "If one tool call would do this, which tool?", "criteria": reflexive});
         // Each MCP server is a yes/no: its tools reach the model only when the request needs them.
         for server in &shared.mcp {
             let names: Vec<&str> = server.tools.iter().filter_map(|t| t["name"].as_str()).map(|n| n.rsplit("__").next().unwrap_or(n)).take(20).collect();
@@ -220,10 +225,18 @@ impl Agent {
             picked = forced;
         }
         let by = if self.shared.s1.has_jev() { "jev" } else { "plan" };
+        let route = match (tier.as_str(), self.force_tier.as_deref()) {
+            ("reflex", None) => "needle only · no LLM".to_string(),
+            (_, Some(pinned)) => format!("llm: {pinned} ({}) · pinned", cfg.spec(pinned).map(|s| s.model.as_str()).unwrap_or("?")),
+            (t, None) => format!("llm: {t} ({})", cfg.spec(t).map(|s| s.model.as_str()).unwrap_or("?")),
+        };
+        let extra: Vec<&str> = groups.iter().map(String::as_str).filter(|g| *g != "core").collect();
+        let tools_note = if extra.is_empty() { String::new() } else { format!(" · tools: {}", extra.join(", ")) };
         let skills_note = if picked.is_empty() { String::new() } else { format!(" · skills: {}", picked.join(", ")) };
-        self.shared.ui.line(&format!("  {by} → {tier} · {}{skills_note}", groups.join(", ")));
+        self.shared.ui.line(&format!("  {by} → {route}{tools_note}{skills_note}"));
         self.last_tier = tier.clone();
-        Plan { tier, groups, skills: picked }
+        let tool = a.get("tool").filter(|t| t.confidence >= sure).map(|t| t.text().to_string()).filter(|t| !t.is_empty());
+        Plan { tier, tool, groups, skills: picked }
     }
 
     fn system(&self, picked: &[String], recalled: &str) -> String {
@@ -262,17 +275,46 @@ impl Agent {
 
     // -- System 1 acts ------------------------------------------------------------------------
 
-    fn reflex(&mut self, text: &str, groups: &[String]) -> Option<String> {
-        let (calls, confidence) = self.shared.s1.act(text, &self.schemas(groups), "");
-        if calls.len() != 1 || confidence < self.cfg().s1.needle_confidence {
+    fn reflex(&mut self, text: &str, groups: &[String], tool: Option<&str>) -> Option<String> {
+        let mut schemas = self.schemas(groups);
+        if let Some(tool) = tool {
+            schemas.retain(|s| s["name"] == tool);
+        }
+        let (calls, confidence) = self.shared.s1.act(text, &schemas, "");
+        // Needle's confidence scores its whole answer, "no call" included, and is low (0.1-0.4) on
+        // calls that are right, so it can't gate alone (measured in tests/cactus_live.rs). The gate
+        // is: one call, to the tool Jev chose, with every argument taken from the user's own words.
+        // Without Jev's choice, Needle's confidence has to stand in for it.
+        let call = calls.first().filter(|_| calls.len() == 1);
+        let why = match call {
+            None => Some("made no call".to_string()),
+            Some(c) if tool.is_some_and(|t| c["name"] != t) => Some(format!("chose {} over {}", c["name"].as_str().unwrap_or("?"), tool.unwrap_or(""))),
+            Some(c) if !grounded(&c["arguments"], text) => Some(format!("invented an argument: {}", c["arguments"])),
+            Some(_) if tool.is_none() && confidence < self.cfg().s1.needle_confidence => Some(format!("unsure ({confidence:.2})")),
+            Some(c) if self.shared.s1.has_jev() && !self.jev_approves(text, c) => Some(format!("call rejected by jev: {}({})", c["name"].as_str().unwrap_or("?"), c["arguments"])),
+            Some(_) => None,
+        };
+        if let Some(why) = why {
+            self.shared.ui.line(&format!("  needle {why} → llm: fast"));
             return None;
         }
+        let calls = vec![call?.clone()];
         let name = calls[0]["name"].as_str()?.to_string();
         let args = calls[0].get("arguments").cloned().unwrap_or(json!({}));
         let result = self.call(&name, &args, "⚡");
         self.messages.push(json!({"role": "assistant", "content": format!("[ran {name}({args})]\n{result}")}));
         self.last_tier = "reflex".into();
         Some(result)
+    }
+
+    /// Jev reads the finished call against the request before a reflex runs it.
+    fn jev_approves(&self, request: &str, call: &Value) -> bool {
+        let a = self.shared.s1.decide(
+            &format!("REQUEST: {request}\nTOOL CALL: {}({})", call["name"].as_str().unwrap_or(""), call["arguments"]),
+            &json!({"exact": {"type": "noul", "instructions": "This tool call does exactly what the request asks, with the right arguments."}}),
+            None,
+        );
+        a["exact"].yes() && a["exact"].confidence >= self.cfg().s1.confidence
     }
 
     // -- System 2 thinks ----------------------------------------------------------------------
@@ -338,7 +380,7 @@ impl Agent {
             }
             for call in &reply.tool_calls {
                 let result = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
-                    Ok(args) => self.call(&call.name, &args, "·"),
+                    Ok(args) => self.call(&call.name, &args, "⏺"),
                     Err(_) => "error: tool arguments were not valid JSON".into(),
                 };
                 self.messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": result}));
@@ -378,7 +420,16 @@ impl Agent {
         if builtin.is_none() && server.is_none() {
             return format!("error: unknown tool {name}");
         }
-        self.shared.ui.line(&format!("  {mark} {name}({shown})"));
+        // The argument a person would want to see: the path, the command, the query.
+        let brief: String = ["command", "path", "url", "query", "goal", "question", "name", "to"]
+            .iter()
+            .find_map(|k| args[*k].as_str())
+            .map(String::from)
+            .unwrap_or_else(|| shown.clone())
+            .chars()
+            .take(90)
+            .collect();
+        self.shared.ui.line(&format!("  {mark} {name}  {}", brief.replace('\n', " ")));
         self.calls.push((name.to_string(), args.clone()));
         // Snapshot the folder before the first change of the turn, so /undo can put it back.
         let mutating = matches!(name, "write_file" | "edit_file") || (name == "shell" && !tools::is_read_only(args["command"].as_str().unwrap_or("")));
@@ -404,10 +455,14 @@ impl Agent {
             }
             (None, None) => unreachable!(),
         };
-        match result {
+        let result = match result {
             Ok(result) => tools::clip(&result),
             Err(e) => format!("error: {e:#}"),
-        }
+        };
+        let first: String = result.lines().find(|l| !l.trim().is_empty()).unwrap_or("(no output)").chars().take(90).collect();
+        let more = result.lines().count().saturating_sub(1);
+        self.shared.ui.line(&format!("    ⎿ {first}{}", if more > 0 { format!("  (+{more} lines)") } else { String::new() }));
+        result
     }
 
     // -- context ------------------------------------------------------------------------------
@@ -441,6 +496,23 @@ impl Agent {
         self.messages.insert(0, json!({"role": "user", "content": format!("[Earlier conversation, compacted. The exact text is in memory: use recall.]\n{summary}")}));
         self.shared.ui.line("  ⇣ context compacted; the exact text is in memory");
     }
+}
+
+/// Whether every text argument of a call appears in the request: a reflex must not invent.
+/// A path or URL with a space in it is a phrase swallowed whole ("open src/main.rs" as a path),
+/// unless the user quoted it.
+pub fn grounded(args: &Value, request: &str) -> bool {
+    let said = request.to_lowercase();
+    let found = |v: &Value| v.as_str().is_none_or(|s| !s.trim().is_empty() && said.contains(s.trim().to_lowercase().as_str()));
+    args.as_object().is_none_or(|o| {
+        o.iter().all(|(key, v)| {
+            let phrase = matches!(key.as_str(), "path" | "url") && v.as_str().is_some_and(|s| s.trim().contains(' ') && !request.contains(&format!("\"{}\"", s.trim())));
+            !phrase && match v {
+                Value::Array(items) => items.iter().all(found),
+                other => found(other),
+            }
+        })
+    })
 }
 
 // -- self-improvement -------------------------------------------------------------------------

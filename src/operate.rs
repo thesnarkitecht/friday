@@ -226,7 +226,9 @@ impl Env for Browser {
     }
 
     fn goto(&mut self, url: &str) -> Result<()> {
-        let url = if url.contains("://") { url.to_string() } else { format!("https://{url}") };
+        // "example.com" means https; a URL with a scheme (https://, file://, data:, about:) is as given.
+        let as_given = url.contains("://") || url.starts_with("data:") || url.starts_with("about:");
+        let url = if as_given { url.to_string() } else { format!("https://{url}") };
         self.tab.navigate_to(&url)?.wait_until_navigated()?;
         Ok(())
     }

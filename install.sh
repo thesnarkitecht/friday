@@ -40,7 +40,8 @@ else
   command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1 || fail \
     "building needs a C compiler. macOS: xcode-select --install   Debian/Ubuntu: sudo apt install build-essential"
   # A private toolchain: rustup's own installer, pointed at a temporary folder, with no PATH edits.
-  export RUSTUP_HOME="$TMP/rustup" CARGO_HOME="$TMP/cargo"
+  # Build-time downloads (the ONNX runtime) go there too, so nothing is left behind.
+  export RUSTUP_HOME="$TMP/rustup" CARGO_HOME="$TMP/cargo" XDG_CACHE_HOME="$TMP/cache"
   say "fetching a private Rust toolchain (removed when done)"
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --quiet --no-modify-path --profile minimal --default-toolchain stable >/dev/null
   "$CARGO_HOME/bin/cargo" install --quiet --locked --root "$TMP/build" \

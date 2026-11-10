@@ -51,6 +51,12 @@ enum Cmd {
     },
     /// Show the Needle training data Friday has collected
     Train,
+    /// Use an image (PNG or JPEG) as the logo on the opening screen; `--reset` for the coin
+    Logo {
+        image: Option<std::path::PathBuf>,
+        #[arg(long)]
+        reset: bool,
+    },
     /// Put files back as they were before Friday's last change in this folder
     Undo,
     /// Message another agent
@@ -87,6 +93,19 @@ fn main() -> Result<()> {
     let home = config::home();
     match &cli.cmd {
         Some(Cmd::Init) => return ui::init(&home),
+        Some(Cmd::Logo { image, reset }) => {
+            let path = home.join("logo.txt");
+            if *reset {
+                let _ = std::fs::remove_file(&path);
+                return Ok(println!("  back to the coin"));
+            }
+            let Some(image) = image else { bail!("give an image: friday logo path/to/logo.png") };
+            let art = friday::coin::image_to_art(image, friday::coin::ROWS as u32)?;
+            std::fs::create_dir_all(&home)?;
+            std::fs::write(&path, art.join("\n"))?;
+            friday::coin::reveal(&art, &[], false);
+            return Ok(println!("  saved; it opens every session. `friday logo --reset` brings back the coin"));
+        }
         Some(Cmd::Undo) => return Ok(println!("  {}", friday::checkpoint::undo(&home, &std::env::current_dir()?)?)),
         Some(Cmd::Send { to, text }) => {
             Bus::open(&home)?.send(&cli.name, to, text)?;

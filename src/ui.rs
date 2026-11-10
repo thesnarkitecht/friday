@@ -82,12 +82,43 @@ fn render(line: &str, in_code: &mut bool) -> String {
     }
 }
 
+/// Colour a status line by what it is: a plan, a tool call, a result, a fast-path action.
+fn style(text: &str) -> String {
+    let t = text.trim_start();
+    let pad = &text[..text.len() - t.len()];
+    if let Some(rest) = t.strip_prefix("⚡ ") {
+        let (name, arg) = rest.split_once("  ").unwrap_or((rest, ""));
+        return format!("{pad}{BOLT}⚡ {BOLD}{name}{OFF}  {DIM}{arg}{OFF}");
+    }
+    if let Some(rest) = t.strip_prefix("⏺ ") {
+        let (name, arg) = rest.split_once("  ").unwrap_or((rest, ""));
+        return format!("{pad}{ACCENT}⏺{OFF} {BOLD}{name}{OFF}  {DIM}{arg}{OFF}");
+    }
+    if t.starts_with("jev →") || t.starts_with("plan →") {
+        let lit = t.replacen("needle only · no LLM", &format!("{BOLT}needle only · no LLM{DIM}"), 1);
+        let lit = match lit.find("llm: ") {
+            Some(i) => {
+                let end = lit[i..].find(" ·").map_or(lit.len(), |j| i + j);
+                format!("{}{ACCENT}{}{DIM}{}", &lit[..i], &lit[i..end], &lit[end..])
+            }
+            None => lit,
+        };
+        return format!("{pad}{DIM}{lit}{OFF}");
+    }
+    if t.starts_with('✎') {
+        return format!("{pad}{BOLT}{t}{OFF}");
+    }
+    if t.starts_with('↑') || t.starts_with("needle ") {
+        return format!("{pad}\x1b[33m{t}{OFF}");
+    }
+    format!("{DIM}{text}{OFF}")
+}
+
 impl Ui for Screen {
     fn line(&self, text: &str) {
         let mut s = self.state.lock().unwrap();
         pause(&mut s);
-        let color = if text.contains('⚡') || text.trim_start().starts_with("jev") { BOLT } else { DIM };
-        println!("{color}{text}{OFF}");
+        println!("{}", style(text));
         resume(&mut s);
     }
 
@@ -154,16 +185,22 @@ impl Screen {
         let mut s = self.state.lock().unwrap();
         s.busy = false;
         pause(&mut s);
-        if !reply.trim().is_empty() && reply != s.streamed {
+        // A one-line reflex result is already on screen as its tool line's preview.
+        let shown = agent.last_tier == "reflex" && reply.trim().lines().count() <= 1;
+        if !shown && !reply.trim().is_empty() && reply != s.streamed {
             // Reflex results and errors are not streamed.
             let mut in_code = false;
             for line in reply.lines() {
                 println!("{}", if agent.last_tier == "reflex" { format!("  {line}") } else { render(line, &mut in_code) });
             }
         }
+        let route = if agent.last_tier == "reflex" {
+            format!("{BOLT}⚡ needle{DIM}")
+        } else {
+            format!("{ACCENT}◆ {}{DIM} {}", agent.last_tier, agent.shared.cfg.spec(&agent.last_tier).map(|s| s.model.as_str()).unwrap_or(""))
+        };
         println!(
-            "{DIM}  {} · system 1 ×{} · system 2 ×{} · context {:.0}% · {:.1}s{OFF}\n",
-            agent.last_tier,
+            "{DIM}  {route} · system 1 ×{} · system 2 ×{} · context {:.0}% · {:.1}s{OFF}\n",
             count(&["jev", "needle", "mirage"]) - fast_before,
             count(&["s2"]) - slow_before,
             agent.context_used * 100.0,
@@ -202,13 +239,16 @@ const COMMANDS: [(&str, &str); 8] = [
 ];
 
 #[derive(rustyline::Helper, rustyline::Hinter, rustyline::Validator)]
-struct Line;
+struct Line {
+    /// Slash commands, then `/<skill>` for every skill.
+    words: Vec<String>,
+}
 
 impl rustyline::completion::Completer for Line {
     type Candidate = String;
     fn complete(&self, line: &str, pos: usize, _: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
         let typed = &line[..pos];
-        let matches = if typed.starts_with('/') { COMMANDS.iter().filter(|c| c.0.starts_with(typed)).map(|c| c.0.to_string()).collect() } else { Vec::new() };
+        let matches = if typed.starts_with('/') && !typed.contains(' ') { self.words.iter().filter(|w| w.starts_with(typed)).cloned().collect() } else { Vec::new() };
         Ok((0, matches))
     }
 }
@@ -303,10 +343,15 @@ pub fn load_session(agent: &Agent) -> Vec<Value> {
 }
 
 pub fn chat_loop(agent: &mut Agent, screen: &Screen, animate: bool) -> Result<()> {
-    coin::spin(&banner(agent), if animate { 1.7 } else { 0.0 });
+    match std::fs::read_to_string(agent.shared.cfg.home.join("logo.txt")) {
+        Ok(logo) => coin::reveal(&logo.lines().map(String::from).collect::<Vec<_>>(), &banner(agent), animate),
+        Err(_) => coin::spin(&banner(agent), if animate { 1.7 } else { 0.0 }),
+    }
     println!();
     let mut editor = rustyline::Editor::<Line, rustyline::history::DefaultHistory>::new()?;
-    editor.set_helper(Some(Line));
+    let mut words: Vec<String> = COMMANDS.iter().map(|c| c.0.to_string()).collect();
+    words.extend(skills::load(&agent.shared.cfg).into_keys().map(|n| format!("/{n}")));
+    editor.set_helper(Some(Line { words }));
     let history = agent.shared.cfg.home.join("history");
     let _ = editor.load_history(&history);
     loop {

@@ -32,14 +32,16 @@ fn system2_uses_tools_then_answers() {
 #[test]
 fn a_reflex_needs_no_system2() {
     let fake = Fake::start();
-    *fake.jev.lock().unwrap() = jev(&[("tier", json!("reflex"), 0.95)]);
+    *fake.jev.lock().unwrap() = jev(&[("tier", json!("reflex"), 0.95), ("tool", json!("read_file"), 0.9), ("exact", json!(true), 0.9)]);
     let dir = tempfile::tempdir().unwrap();
     let notes = dir.path().join("notes.txt");
     std::fs::write(&notes, "remember the milk").unwrap();
-    let mut r = rig(&fake, needle_says("read_file", json!({"path": notes}), 0.9), true, |_| {});
-    assert_eq!(r.agent.turn("read notes.txt"), "remember the milk");
+    // Low confidence is fine: Jev chose the tool and the path is in the user's words.
+    let mut r = rig(&fake, needle_says("read_file", json!({"path": notes}), 0.2), true, |_| {});
+    assert_eq!(r.agent.turn(&format!("read {}", notes.display())), "remember the milk");
     assert!(fake.requests().is_empty());
     assert_eq!(r.agent.last_tier, "reflex");
+    assert!(r.ui.saw("jev → needle only · no LLM") && r.ui.saw("⚡ read_file") && r.ui.saw("⎿ remember the milk"));
     r.finish();
 }
 
@@ -51,6 +53,7 @@ fn an_unsure_reflex_goes_to_the_fast_model() {
     let mut r = rig(&fake, needle_says("shell", json!({"command": "rm -rf /"}), 0.2), true, |_| {});
     assert_eq!(r.agent.turn("hmm"), "thought about it");
     assert_eq!(fake.requests()[0]["model"], "fast-model");
+    assert!(r.ui.saw("needle invented an argument"));
     r.finish();
 }
 
@@ -505,7 +508,7 @@ fn friday_run_prints_only_the_answer_on_stdout() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("plan → main"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("plan → llm: main (m)"));
 }
 
 
@@ -791,4 +794,45 @@ fn todo_ask_user_and_fetch_url_work() {
     assert!(results[2].ends_with("Docs Use <b> & more") && !results[2].contains("evil"), "{}", results[2]);
     assert!(r.ui.saw("1/2 done"));
     r.finish();
+}
+
+#[test]
+fn a_logo_image_becomes_true_colour_terminal_art() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("logo.png");
+    // 40x40: transparent background, a red top half and a blue bottom half in the middle.
+    let mut img = image::RgbaImage::new(40, 40);
+    for y in 10..30 {
+        for x in 10..30 {
+            img.put_pixel(x, y, if y < 20 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        }
+    }
+    img.save(&path).unwrap();
+    let art = coin::image_to_art(&path, 12).unwrap();
+    assert_eq!(art.len(), 12);
+    let all = art.concat();
+    assert!(all.contains("38;2;255;0;0") && all.contains("38;2;0;0;255"), "both colours survive");
+    assert!(art[0].chars().all(|c| c == ' '), "transparent stays transparent");
+}
+
+#[test]
+fn a_reflex_jev_rejects_never_runs() {
+    let fake = Fake::start();
+    *fake.jev.lock().unwrap() = jev(&[("tier", json!("reflex"), 0.95), ("tool", json!("shell"), 0.9), ("exact", json!(false), 0.9)]);
+    fake.script(vec![say("handled properly", &[])]);
+    let mut r = rig(&fake, needle_says("shell", json!({"command": "ls"}), 0.9), true, |_| {});
+    assert_eq!(r.agent.turn("ls the parent folder"), "handled properly");
+    assert!(r.ui.saw("call rejected by jev"));
+    r.finish();
+}
+
+#[test]
+fn grounding_rejects_invented_and_swallowed_arguments() {
+    use friday::agent::grounded;
+    assert!(grounded(&json!({"path": "notes.txt"}), "read notes.txt"));
+    assert!(!grounded(&json!({"path": "secrets.env"}), "read notes.txt"));
+    assert!(!grounded(&json!({"path": "open src/main.rs"}), "open src/main.rs"));
+    assert!(grounded(&json!({"path": "My Docs/a.txt"}), "read \"My Docs/a.txt\""));
+    assert!(grounded(&json!({"command": "cargo test"}), "run cargo test"));
+    assert!(!grounded(&json!({"command": ""}), "run it"));
 }
