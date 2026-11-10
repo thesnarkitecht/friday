@@ -17,6 +17,49 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
+impl Skill {
+    /// Where it came from, for display: claude, hermes, friday, or the project.
+    pub fn origin(&self) -> &'static str {
+        let p = self.path.to_string_lossy();
+        if p.contains("/.claude/") { "claude" } else if p.contains("/.hermes/") { "hermes" } else if p.contains("/.friday/skills/") && !p.contains("/.friday/skills/history") { "friday" } else { "project" }
+    }
+
+    /// Everything else in the skill's folder (scripts, references, templates), read on demand.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Some(dir) = self.path.parent() else { return out };
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if name == "history" || name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path != self.path && out.len() < 30 {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The skill as it goes into the system prompt: its text, then its files by path.
+    pub fn render(&self, name: &str) -> String {
+        let body = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let mut out = format!("# Skill `{name}` applies. Follow it.\n{}", crate::tools::clip(&body));
+        let files = self.files();
+        if !files.is_empty() {
+            out.push_str("\nIts supporting files, to read or run when a step needs them:\n");
+            out.extend(files.iter().map(|f| format!("- {}\n", f.display())));
+        }
+        out
+    }
+}
+
 fn field(text: &str, name: &str) -> Option<String> {
     let prefix = format!("{name}:");
     text.lines().take(40).find_map(|l| l.strip_prefix(&prefix)).map(|v| v.trim().trim_matches('"').to_string()).filter(|v| !v.is_empty())
@@ -27,6 +70,9 @@ fn find(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
+        if path.file_name().is_some_and(|n| n == "history" || n.to_string_lossy().starts_with('.')) {
+            continue;
+        }
         if path.is_dir() && depth > 0 {
             find(&path, depth - 1, out);
         } else if path.file_name().is_some_and(|n| n == "SKILL.md") {
@@ -40,7 +86,7 @@ pub fn load(cfg: &Config) -> BTreeMap<String, Skill> {
     let mut found = BTreeMap::new();
     for dir in &cfg.skill_dirs {
         let mut files = Vec::new();
-        find(dir, 4, &mut files); // Hermes nests skills under category folders
+        find(dir, 5, &mut files); // Hermes nests skills under category folders; packs add a level
         for path in files {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let folder = path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -72,6 +118,12 @@ pub fn save(cfg: &Config, text: &str) -> Result<Option<String>> {
     }
     let dir = cfg.home.join("skills").join(&slug);
     std::fs::create_dir_all(&dir)?;
+    // Every rewrite keeps the version it replaces.
+    if let Ok(old) = std::fs::read_to_string(dir.join("SKILL.md")) {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+        std::fs::create_dir_all(dir.join("history"))?;
+        std::fs::write(dir.join("history").join(format!("{stamp}.md")), old)?;
+    }
     std::fs::write(dir.join("SKILL.md"), format!("{text}\n"))?;
     Ok(Some(slug))
 }
@@ -83,7 +135,10 @@ pub fn scores(cfg: &Config) -> BTreeMap<String, (u32, u32)> {
 
 fn write_scores(cfg: &Config, data: &BTreeMap<String, (u32, u32)>) -> Result<()> {
     std::fs::create_dir_all(cfg.home.join("skills"))?;
-    Ok(std::fs::write(cfg.home.join("skills/scores.json"), serde_json::to_string(data)?)?)
+    // Write then rename: a crash mid-write must not wipe every skill's record.
+    let path = cfg.home.join("skills/scores.json");
+    std::fs::write(path.with_extension("tmp"), serde_json::to_string(data)?)?;
+    Ok(std::fs::rename(path.with_extension("tmp"), path)?)
 }
 
 pub fn record(cfg: &Config, names: &[String], won: bool) -> Result<()> {
@@ -107,6 +162,49 @@ pub fn reset(cfg: &Config, name: &str) -> Result<()> {
         write_scores(cfg, &data)?;
     }
     Ok(())
+}
+
+/// The `limit` skills most like `request`: by embedding when there is a model, else by shared words.
+pub fn shortlist(request: &str, all: &BTreeMap<String, Skill>, limit: usize, embed: &dyn Fn(&str) -> Option<Vec<f32>>) -> Vec<String> {
+    if all.len() <= limit {
+        return all.keys().cloned().collect();
+    }
+    let words = |t: &str| -> std::collections::HashSet<String> { t.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2).map(String::from).collect() };
+    let query = embed(request);
+    let asked = words(request);
+    let mut scored: Vec<(f32, &String)> = all
+        .iter()
+        .map(|(name, skill)| {
+            let text = format!("{name}: {}", skill.description);
+            let score = match (&query, embed(&text)) {
+                (Some(q), Some(v)) => crate::memory::cosine(q, &v),
+                _ => words(&text).intersection(&asked).count() as f32,
+            };
+            (score, name)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
+    scored.into_iter().take(limit).map(|(_, n)| n.clone()).collect()
+}
+
+/// Copy a skill pack (a git repository or a local folder) into the home skills folder.
+pub fn add(cfg: &Config, source: &str) -> Result<(String, usize)> {
+    let name: String = source.trim_end_matches('/').trim_end_matches(".git").rsplit(['/', ':']).next().unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    if name.is_empty() {
+        anyhow::bail!("cannot tell what to call {source}");
+    }
+    let dest = cfg.home.join("skills").join(&name);
+    if dest.exists() {
+        anyhow::bail!("{} already exists; remove it first to replace it", dest.display());
+    }
+    std::fs::create_dir_all(cfg.home.join("skills"))?;
+    let status = std::process::Command::new("git").args(["clone", "--quiet", "--depth", "1", "--", source]).arg(&dest).status()?;
+    if !status.success() {
+        anyhow::bail!("git clone {source} failed");
+    }
+    let mut found = Vec::new();
+    find(&dest, 4, &mut found);
+    Ok((name, found.len()))
 }
 
 pub fn distill_prompt(existing: &str, work: &str) -> String {

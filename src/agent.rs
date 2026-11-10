@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 
 const MAX_STEPS: usize = 40;
 const MAX_SKILLS: usize = 3;
+const SHORTLIST: usize = 24;
 
 /// Where an agent's activity goes: a terminal, a log, a test.
 pub trait Ui: Send + Sync {
@@ -48,6 +49,7 @@ pub struct Shared {
     pub yolo: AtomicBool,
     /// Who the user is, for the system prompt: their identity file and their peer card.
     pub wake: String,
+    pub mcp: Vec<crate::mcp::Server>,
 }
 
 pub struct Agent {
@@ -59,17 +61,25 @@ pub struct Agent {
     speaker: String,
     pub messages: Vec<Value>,
     pub force_tier: Option<String>,
+    /// Skills the user named for the next turn (`/name` or `--skill`), followed whatever System 1 says.
+    pub force_skills: Vec<String>,
     /// Fraction of the context window the last request filled.
     pub context_used: f64,
     pub last_tier: String,
     calls: Vec<(String, Value)>,
     clean: bool,
+    /// Whether this turn has already taken its checkpoint.
+    checkpointed: bool,
+    /// The agent's own plan for a long task, set with the `todo` tool.
+    pub todo: Vec<String>,
     pub learner: Option<JoinHandle<()>>,
 }
 
 pub struct Plan {
     pub tier: String,
-    pub groups: Vec<&'static str>,
+    /// For a reflex: the one tool Jev chose, so Needle only fills in its arguments.
+    pub tool: Option<String>,
+    pub groups: Vec<String>,
     pub skills: Vec<String>,
 }
 
@@ -77,8 +87,8 @@ impl Agent {
     pub fn new(shared: Arc<Shared>, name: &str) -> Agent {
         let speaker = shared.cfg.user.clone();
         Agent {
-            shared, name: name.into(), role: String::new(), depth: 0, speaker, messages: Vec::new(), force_tier: None,
-            context_used: 0.0, last_tier: String::new(), calls: Vec::new(), clean: true, learner: None,
+            shared, name: name.into(), role: String::new(), depth: 0, speaker, messages: Vec::new(), force_tier: None, force_skills: Vec::new(),
+            context_used: 0.0, last_tier: String::new(), calls: Vec::new(), clean: true, checkpointed: false, todo: Vec::new(), learner: None,
         }
     }
 
@@ -133,7 +143,8 @@ impl Agent {
         self.messages.push(json!({"role": "user", "content": text}));
         self.calls.clear();
         self.clean = true;
-        let reflex = if plan.tier == "reflex" { self.reflex(text, &plan.groups) } else { None };
+        self.checkpointed = false;
+        let reflex = if plan.tier == "reflex" { self.reflex(text, &plan.groups, plan.tool.as_deref()) } else { None };
         let reflexed = reflex.is_some();
         let reply = reflex.unwrap_or_else(|| {
             let tier = self.force_tier.clone().unwrap_or(if plan.tier == "reflex" { "fast".into() } else { plan.tier.clone() });
@@ -154,16 +165,22 @@ impl Agent {
 
     /// System 1 decides how much model, which tool groups, and which skills this turn gets.
     pub fn plan(&mut self, text: &str) -> Plan {
-        let cfg = self.cfg();
+        let forced = std::mem::take(&mut self.force_skills);
+        let shared = self.shared.clone();
+        let cfg = &shared.cfg;
         let marks = skills::scores(cfg);
         let mut known = skills::load(cfg);
         known.retain(|name, _| skills::healthy(marks.get(name)));
+        // Jev chooses among the closest few; past that, a long list only dilutes the choice.
+        let memory = self.shared.memory.clone();
+        let near = skills::shortlist(text, &known, SHORTLIST, &|t| memory.embed(t));
+        known.retain(|name, _| near.contains(name) && !forced.contains(name));
         let mut questions = json!({
             "tier": {
                 "type": "choice",
                 "instructions": "How much model capability does this request need?",
                 "criteria": {
-                    "reflex": "one direct action that maps to a single tool call, like reading a named file or running a given command",
+                    "reflex": "Needle alone, no LLM: one direct action that is a single tool call, like reading a named file or running a given command",
                     "fast": "small talk, a simple question, or a trivial edit",
                     "main": "multi-step coding, research or automation",
                     "deep": "hard design, subtle debugging, or long-horizon planning"
@@ -174,8 +191,15 @@ impl Agent {
             "desktop": {"type": "noul", "instructions": "Doing this requires controlling this computer's mouse, keyboard and screen."},
             "agents": {"type": "noul", "instructions": "This splits into independent subtasks worth running in parallel, or involves messaging other agents."}
         });
-        if !known.is_empty() {
-            // shortcut: the whole library goes in one question; prefilter once it passes ~100 skills.
+        // For a reflex, Jev also picks the tool: Needle is far surer filling in one tool than choosing among many.
+        let reflexive: serde_json::Map<String, Value> = tools::all().into_iter().filter(|t| matches!(t.group, "core" | "web")).map(|t| (t.name.to_string(), json!(t.description))).collect();
+        questions["tool"] = json!({"type": "choice", "instructions": "If one tool call would do this, which tool?", "criteria": reflexive});
+        // Each MCP server is a yes/no: its tools reach the model only when the request needs them.
+        for server in &shared.mcp {
+            let names: Vec<&str> = server.tools.iter().filter_map(|t| t["name"].as_str()).map(|n| n.rsplit("__").next().unwrap_or(n)).take(20).collect();
+            questions[format!("mcp:{}", server.name)] = json!({"type": "noul", "instructions": format!("Doing this needs the `{}` tools: {}.", server.name, names.join(", "))});
+        }
+        if !known.is_empty() && forced.is_empty() {
             let mut criteria: serde_json::Map<String, Value> = known.iter().map(|(n, s)| (n.clone(), json!(if s.description.is_empty() { n } else { &s.description }))).collect();
             criteria.insert("none".into(), json!("no saved skill applies"));
             questions["skills"] = json!({"type": "choice", "instructions": "Which saved skill is the best guide for carrying out this request?", "criteria": criteria, "default": "none"});
@@ -184,8 +208,9 @@ impl Agent {
         let sure = cfg.s1.confidence;
         let tier = if a["tier"].confidence >= sure { a["tier"].text().to_string() } else { "main".into() };
         // A tool group is left out only when System 1 is sure it isn't needed.
-        let mut groups = vec!["core"];
-        groups.extend(["web", "desktop", "agents"].into_iter().filter(|g| a[*g].yes() || a[*g].confidence < sure));
+        let mut groups = vec!["core".to_string()];
+        groups.extend(["web", "desktop", "agents"].into_iter().filter(|g| a[*g].yes() || a[*g].confidence < sure).map(String::from));
+        groups.extend(shared.mcp.iter().map(|s| format!("mcp:{}", s.name)).filter(|g| a.get(g).is_none_or(|x| x.yes() || x.confidence < sure)));
         let mut picked = Vec::new();
         if let Some(best) = a.get("skills").filter(|b| b.confidence >= sure && known.contains_key(b.text())) {
             // The winner, plus any runner-up Jev also gives real weight to.
@@ -196,11 +221,22 @@ impl Agent {
                 picked.push(best.text().to_string());
             }
         }
+        if !forced.is_empty() {
+            picked = forced;
+        }
         let by = if self.shared.s1.has_jev() { "jev" } else { "plan" };
+        let route = match (tier.as_str(), self.force_tier.as_deref()) {
+            ("reflex", None) => "needle only · no LLM".to_string(),
+            (_, Some(pinned)) => format!("llm: {pinned} ({}) · pinned", cfg.spec(pinned).map(|s| s.model.as_str()).unwrap_or("?")),
+            (t, None) => format!("llm: {t} ({})", cfg.spec(t).map(|s| s.model.as_str()).unwrap_or("?")),
+        };
+        let extra: Vec<&str> = groups.iter().map(String::as_str).filter(|g| *g != "core").collect();
+        let tools_note = if extra.is_empty() { String::new() } else { format!(" · tools: {}", extra.join(", ")) };
         let skills_note = if picked.is_empty() { String::new() } else { format!(" · skills: {}", picked.join(", ")) };
-        self.shared.ui.line(&format!("  {by} → {tier} · {}{skills_note}", groups.join(", ")));
+        self.shared.ui.line(&format!("  {by} → {route}{tools_note}{skills_note}"));
         self.last_tier = tier.clone();
-        Plan { tier, groups, skills: picked }
+        let tool = a.get("tool").filter(|t| t.confidence >= sure).map(|t| t.text().to_string()).filter(|t| !t.is_empty());
+        Plan { tier, tool, groups, skills: picked }
     }
 
     fn system(&self, picked: &[String], recalled: &str) -> String {
@@ -215,10 +251,17 @@ impl Agent {
         if !self.role.is_empty() {
             parts.push(self.role.clone());
         }
+        // The project's own instructions, in the files other harnesses already use.
+        let here = std::env::current_dir().unwrap_or_default();
+        for file in ["AGENTS.md", "CLAUDE.md", ".friday/FRIDAY.md"] {
+            if let Ok(text) = std::fs::read_to_string(here.join(file)) {
+                parts.push(format!("# Project instructions ({file})\n{}", tools::clip(&text)));
+            }
+        }
         let known = skills::load(self.cfg());
         for name in picked {
-            if let Some(body) = known.get(name).and_then(|s| std::fs::read_to_string(&s.path).ok()) {
-                parts.push(format!("# Skill `{name}` applies. Follow it.\n{body}"));
+            if let Some(skill) = known.get(name) {
+                parts.push(skill.render(name));
             }
         }
         if !self.shared.wake.is_empty() {
@@ -232,11 +275,30 @@ impl Agent {
 
     // -- System 1 acts ------------------------------------------------------------------------
 
-    fn reflex(&mut self, text: &str, groups: &[&str]) -> Option<String> {
-        let (calls, confidence) = self.shared.s1.act(text, &tools::schemas(groups), "");
-        if calls.len() != 1 || confidence < self.cfg().s1.needle_confidence {
+    fn reflex(&mut self, text: &str, groups: &[String], tool: Option<&str>) -> Option<String> {
+        let mut schemas = self.schemas(groups);
+        if let Some(tool) = tool {
+            schemas.retain(|s| s["name"] == tool);
+        }
+        let (calls, confidence) = self.shared.s1.act(text, &schemas, "");
+        // Needle's confidence scores its whole answer, "no call" included, and is low (0.1-0.4) on
+        // calls that are right, so it can't gate alone (measured in tests/cactus_live.rs). The gate
+        // is: one call, to the tool Jev chose, with every argument taken from the user's own words.
+        // Without Jev's choice, Needle's confidence has to stand in for it.
+        let call = calls.first().filter(|_| calls.len() == 1);
+        let why = match call {
+            None => Some("made no call".to_string()),
+            Some(c) if tool.is_some_and(|t| c["name"] != t) => Some(format!("chose {} over {}", c["name"].as_str().unwrap_or("?"), tool.unwrap_or(""))),
+            Some(c) if !grounded(&c["arguments"], text) => Some(format!("invented an argument: {}", c["arguments"])),
+            Some(_) if tool.is_none() && confidence < self.cfg().s1.needle_confidence => Some(format!("unsure ({confidence:.2})")),
+            Some(c) if self.shared.s1.has_jev() && !self.jev_approves(text, c) => Some(format!("call rejected by jev: {}({})", c["name"].as_str().unwrap_or("?"), c["arguments"])),
+            Some(_) => None,
+        };
+        if let Some(why) = why {
+            self.shared.ui.line(&format!("  needle {why} → llm: fast"));
             return None;
         }
+        let calls = vec![call?.clone()];
         let name = calls[0]["name"].as_str()?.to_string();
         let args = calls[0].get("arguments").cloned().unwrap_or(json!({}));
         let result = self.call(&name, &args, "⚡");
@@ -245,10 +307,20 @@ impl Agent {
         Some(result)
     }
 
+    /// Jev reads the finished call against the request before a reflex runs it.
+    fn jev_approves(&self, request: &str, call: &Value) -> bool {
+        let a = self.shared.s1.decide(
+            &format!("REQUEST: {request}\nTOOL CALL: {}({})", call["name"].as_str().unwrap_or(""), call["arguments"]),
+            &json!({"exact": {"type": "noul", "instructions": "This tool call does exactly what the request asks, with the right arguments."}}),
+            None,
+        );
+        a["exact"].yes() && a["exact"].confidence >= self.cfg().s1.confidence
+    }
+
     // -- System 2 thinks ----------------------------------------------------------------------
 
-    fn think(&mut self, request: &str, tier: &str, groups: &[&str], system: &str) -> String {
-        let specs: Vec<Value> = tools::schemas(groups).into_iter().map(|s| json!({"type": "function", "function": s})).collect();
+    fn think(&mut self, request: &str, tier: &str, groups: &[String], system: &str) -> String {
+        let specs: Vec<Value> = self.schemas(groups).into_iter().map(|s| json!({"type": "function", "function": s})).collect();
         let rungs = match self.cfg().ladder(tier) {
             Ok(rungs) => rungs,
             Err(e) => return format!("error: {e}"),
@@ -258,6 +330,7 @@ impl Agent {
             let top = n == rungs.len() - 1;
             self.last_tier = rung.to_string();
             match self.run_loop(rung, system, &specs) {
+                Err(_) if crate::interrupted() => return "Stopped.".into(),
                 Err(e) => {
                     self.clean = false;
                     if top {
@@ -283,6 +356,9 @@ impl Agent {
     /// The tool loop on one tier. Ok(None) means it ran out of steps.
     fn run_loop(&mut self, tier: &str, system: &str, specs: &[Value]) -> Result<Option<String>> {
         for _ in 0..MAX_STEPS {
+            if crate::interrupted() {
+                return Ok(Some("Stopped.".into()));
+            }
             let shared = self.shared.clone();
             shared.s1.count("s2");
             let mut context = vec![json!({"role": "system", "content": system})];
@@ -304,7 +380,7 @@ impl Agent {
             }
             for call in &reply.tool_calls {
                 let result = match serde_json::from_str::<Value>(if call.arguments.is_empty() { "{}" } else { &call.arguments }) {
-                    Ok(args) => self.call(&call.name, &args, "·"),
+                    Ok(args) => self.call(&call.name, &args, "⏺"),
                     Err(_) => "error: tool arguments were not valid JSON".into(),
                 };
                 self.messages.push(json!({"role": "tool", "tool_call_id": call.id, "content": result}));
@@ -328,18 +404,65 @@ impl Agent {
         a["ok"].yes() || a["ok"].confidence < self.cfg().s1.confidence
     }
 
+    /// The schemas for `groups`: built-in tools, plus each MCP server whose group is included.
+    pub fn schemas(&self, groups: &[String]) -> Vec<Value> {
+        let mut out = tools::schemas(groups);
+        for server in self.shared.mcp.iter().filter(|s| groups.contains(&format!("mcp:{}", s.name))) {
+            out.extend(server.tools.iter().map(|t| json!({"name": t["name"], "description": t["description"], "parameters": t["parameters"]})));
+        }
+        out
+    }
+
     pub fn call(&mut self, name: &str, args: &Value, mark: &str) -> String {
-        let Some(tool) = tools::all().into_iter().find(|t| t.name == name) else {
-            return format!("error: unknown tool {name}");
-        };
         let shown: String = args.to_string().chars().take(120).collect();
-        self.shared.ui.line(&format!("  {mark} {name}({shown})"));
+        let builtin = tools::all().into_iter().find(|t| t.name == name);
+        let server = self.shared.mcp.iter().position(|s| s.tools.iter().any(|t| t["name"] == name));
+        if builtin.is_none() && server.is_none() {
+            return format!("error: unknown tool {name}");
+        }
+        // The argument a person would want to see: the path, the command, the query.
+        let brief: String = ["command", "path", "url", "query", "goal", "question", "name", "to"]
+            .iter()
+            .find_map(|k| args[*k].as_str())
+            .map(String::from)
+            .unwrap_or_else(|| shown.clone())
+            .chars()
+            .take(90)
+            .collect();
+        self.shared.ui.line(&format!("  {mark} {name}  {}", brief.replace('\n', " ")));
         self.calls.push((name.to_string(), args.clone()));
+        // Snapshot the folder before the first change of the turn, so /undo can put it back.
+        let mutating = matches!(name, "write_file" | "edit_file") || (name == "shell" && !tools::is_read_only(args["command"].as_str().unwrap_or("")));
+        if mutating && !self.checkpointed {
+            self.checkpointed = true;
+            let here = std::env::current_dir().unwrap_or_default();
+            let label: String = self.messages.iter().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str()).unwrap_or("").chars().take(72).collect();
+            if let Err(e) = crate::checkpoint::snapshot(&self.shared.cfg.home, &here, &label) {
+                self.shared.ui.line(&format!("  (no checkpoint: {e:#})"));
+            }
+        }
         // A tool failure is information for the model, not a crash.
-        match (tool.run)(self, args) {
+        let result = match (builtin, server) {
+            (Some(tool), _) => (tool.run)(self, args),
+            (None, Some(i)) => {
+                let shared = self.shared.clone();
+                let s = &shared.mcp[i];
+                if !s.trust && !self.approve(&format!("use {name}({shown})")) {
+                    Ok(tools::DENIED.to_string())
+                } else {
+                    s.call(name, args)
+                }
+            }
+            (None, None) => unreachable!(),
+        };
+        let result = match result {
             Ok(result) => tools::clip(&result),
             Err(e) => format!("error: {e:#}"),
-        }
+        };
+        let first: String = result.lines().find(|l| !l.trim().is_empty()).unwrap_or("(no output)").chars().take(90).collect();
+        let more = result.lines().count().saturating_sub(1);
+        self.shared.ui.line(&format!("    ⎿ {first}{}", if more > 0 { format!("  (+{more} lines)") } else { String::new() }));
+        result
     }
 
     // -- context ------------------------------------------------------------------------------
@@ -375,6 +498,23 @@ impl Agent {
     }
 }
 
+/// Whether every text argument of a call appears in the request: a reflex must not invent.
+/// A path or URL with a space in it is a phrase swallowed whole ("open src/main.rs" as a path),
+/// unless the user quoted it.
+pub fn grounded(args: &Value, request: &str) -> bool {
+    let said = request.to_lowercase();
+    let found = |v: &Value| v.as_str().is_none_or(|s| !s.trim().is_empty() && said.contains(s.trim().to_lowercase().as_str()));
+    args.as_object().is_none_or(|o| {
+        o.iter().all(|(key, v)| {
+            let phrase = matches!(key.as_str(), "path" | "url") && v.as_str().is_some_and(|s| s.trim().contains(' ') && !request.contains(&format!("\"{}\"", s.trim())));
+            !phrase && match v {
+                Value::Array(items) => items.iter().all(found),
+                other => found(other),
+            }
+        })
+    })
+}
+
 // -- self-improvement -------------------------------------------------------------------------
 
 /// A call System 2 made that System 1 could have: one line of Needle fine-tuning data.
@@ -393,7 +533,9 @@ fn learn(shared: &Shared, request: &str, reply: &str, picked: &[String], calls: 
         if calls.len() == 1 && !reflexed {
             log_training(cfg, request, &calls[0].0, &calls[0].1)?;
         }
-        if calls.len() < 3 {
+        let marks = skills::scores(cfg);
+        let retired: Vec<&String> = picked.iter().filter(|n| !clean && !skills::healthy(marks.get(*n))).collect();
+        if calls.len() < 3 && retired.is_empty() {
             return Ok(());
         }
         let trace: String = json!(calls).to_string().chars().take(6000).collect();
@@ -416,14 +558,15 @@ fn learn(shared: &Shared, request: &str, reply: &str, picked: &[String], calls: 
             distinct.then_some(&emulate as &dyn Fn(&str) -> Result<String>),
         );
         let verdict = &a["learn"];
-        if verdict.text() == "no" || verdict.confidence < cfg.s1.confidence {
+        // A skill retired for losing is rewritten from this failure, whatever the verdict.
+        let fix = retired.first().map(|n| n.as_str()).or((verdict.text() == "improve").then(|| picked.first().map(String::as_str)).flatten());
+        if fix.is_none() && (verdict.text() == "no" || verdict.confidence < cfg.s1.confidence) {
             return Ok(());
         }
         let mut existing = String::new();
-        if verdict.text() == "improve" {
-            if let Some(body) = picked.first().and_then(|n| skills::load(cfg).remove(n)).and_then(|s| std::fs::read_to_string(s.path).ok()) {
-                existing = format!("Rewrite this existing skill, keeping its name and what still holds:\n{body}");
-            }
+        if let Some(body) = fix.and_then(|n| skills::load(cfg).remove(n)).and_then(|s| std::fs::read_to_string(s.path).ok()) {
+            let why = if retired.is_empty() { "" } else { " It has been failing: find what in it misleads, and fix that." };
+            existing = format!("Rewrite this existing skill, keeping its name and what still holds.{why}\n{body}");
         }
         shared.s1.count("s2");
         if let Some(name) = skills::save(cfg, &models::ask(cfg, "main", &skills::distill_prompt(&existing, &work))?)? {

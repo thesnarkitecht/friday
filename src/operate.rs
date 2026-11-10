@@ -120,6 +120,9 @@ fn perform(env: &mut dyn Env, name: &str, args: &Value) -> Result<()> {
 pub fn operate(agent: &Agent, env: &mut dyn Env, goal: &str) -> Result<String> {
     let (mut history, mut answer, mut last): (Vec<String>, String, Option<Step>) = (Vec::new(), String::new(), None);
     for _ in 0..MAX_STEPS {
+        if crate::interrupted() {
+            break;
+        }
         let (labels, text) = env.observe()?;
         // System 2 takes the step when System 1 is unsure, or is about to repeat itself.
         let (step, who) = match s1_step(agent, goal, &labels, &text, &history).filter(|s| Some(s) != last.as_ref()) {
@@ -168,11 +171,15 @@ pub struct Browser {
 }
 
 impl Browser {
-    /// Launches Chrome or Chromium. FRIDAY_CHROMIUM picks the binary; FRIDAY_CHROMIUM_NO_SANDBOX=1
-    /// turns Chrome's sandbox off, which it requires when running as root in a container.
+    /// Launches Chrome or Chromium: FRIDAY_CHROMIUM, else an installed one, else a Chromium fetched
+    /// once into ~/.friday/chromium. FRIDAY_CHROMIUM_NO_SANDBOX=1 turns Chrome's sandbox off, which
+    /// it requires when running as root in a container.
     pub fn open(url: &str) -> Result<Browser> {
+        let path = std::env::var_os("FRIDAY_CHROMIUM").map(Into::into).or_else(|| headless_chrome::browser::default_executable().ok());
+        let fetch = headless_chrome::FetcherOptions::default().with_install_dir(Some(crate::config::home().join("chromium")));
         let options = headless_chrome::LaunchOptions::default_builder()
-            .path(std::env::var_os("FRIDAY_CHROMIUM").map(Into::into))
+            .path(path)
+            .fetcher_options(fetch)
             .sandbox(std::env::var_os("FRIDAY_CHROMIUM_NO_SANDBOX").is_none())
             .build()
             .map_err(|e| anyhow::anyhow!("browser options: {e}"))?;
@@ -219,7 +226,9 @@ impl Env for Browser {
     }
 
     fn goto(&mut self, url: &str) -> Result<()> {
-        let url = if url.contains("://") { url.to_string() } else { format!("https://{url}") };
+        // "example.com" means https; a URL with a scheme (https://, file://, data:, about:) is as given.
+        let as_given = url.contains("://") || url.starts_with("data:") || url.starts_with("about:");
+        let url = if as_given { url.to_string() } else { format!("https://{url}") };
         self.tab.navigate_to(&url)?.wait_until_navigated()?;
         Ok(())
     }

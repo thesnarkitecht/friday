@@ -27,8 +27,7 @@ pub fn due_events(watches: &[Watch], state: &mut Value, now: u64) -> Vec<String>
             events.push(w.prompt.clone());
             continue;
         }
-        let Ok(out) = Command::new("sh").arg("-c").arg(&w.cmd).output() else { continue };
-        let output = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let Ok(output) = crate::tools::run_command(&w.cmd, std::time::Duration::from_secs(120)) else { continue };
         let digest: String = Sha256::digest(output.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
         let first_look = seen["hash"] == "";
         if seen["hash"] != digest.as_str() {
@@ -88,6 +87,9 @@ pub fn watch(agent: &mut Agent) -> Result<()> {
     loop {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
         tick(agent, &mut state, now)?;
+        if crate::interrupted() {
+            return Ok(());
+        }
         std::fs::write(&path, state.to_string())?;
         std::thread::sleep(std::time::Duration::from_secs(5));
     }

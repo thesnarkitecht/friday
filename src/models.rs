@@ -55,6 +55,13 @@ pub fn chat(cfg: &Config, tier: &str, messages: &[Value], tools: &[Value], mut o
             break;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+        if crate::interrupted() {
+            bail!("interrupted");
+        }
+        // Some providers (OpenRouter among them) report failures inside a 200 stream.
+        if let Some(error) = chunk.get("error") {
+            bail!("{} failed mid-reply: {}", spec.model, error["message"].as_str().unwrap_or(&error.to_string()));
+        }
         if let Some(tokens) = chunk["usage"]["prompt_tokens"].as_u64() {
             reply.prompt_tokens = tokens;
         }
@@ -67,7 +74,12 @@ pub fn chat(cfg: &Config, tier: &str, messages: &[Value], tools: &[Value], mut o
         }
         // Tool calls arrive in fragments, addressed by index.
         for part in delta["tool_calls"].as_array().into_iter().flatten() {
-            let index = part["index"].as_u64().unwrap_or(0) as usize;
+            // Without an index (some servers omit it), a fragment with an id starts a new call.
+            let index = match part["index"].as_u64() {
+                Some(i) => i as usize,
+                None if part["id"].is_string() || reply.tool_calls.is_empty() => reply.tool_calls.len(),
+                None => reply.tool_calls.len() - 1,
+            };
             if reply.tool_calls.len() <= index {
                 reply.tool_calls.resize(index + 1, ToolCall::default());
             }
@@ -82,6 +94,15 @@ pub fn chat(cfg: &Config, tier: &str, messages: &[Value], tools: &[Value], mut o
                 call.arguments.push_str(arguments);
             }
         }
+    }
+    for (i, call) in reply.tool_calls.iter_mut().enumerate() {
+        if call.id.is_empty() {
+            call.id = format!("call_{i}"); // a tool result must name the call it answers
+        }
+    }
+    if reply.prompt_tokens == 0 {
+        // No usage reported: estimate (about 4 characters a token) so compaction still happens.
+        reply.prompt_tokens = (json!(messages).to_string().len() / 4) as u64;
     }
     Ok(reply)
 }

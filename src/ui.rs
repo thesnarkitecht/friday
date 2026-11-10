@@ -82,12 +82,43 @@ fn render(line: &str, in_code: &mut bool) -> String {
     }
 }
 
+/// Colour a status line by what it is: a plan, a tool call, a result, a fast-path action.
+fn style(text: &str) -> String {
+    let t = text.trim_start();
+    let pad = &text[..text.len() - t.len()];
+    if let Some(rest) = t.strip_prefix("⚡ ") {
+        let (name, arg) = rest.split_once("  ").unwrap_or((rest, ""));
+        return format!("{pad}{BOLT}⚡ {BOLD}{name}{OFF}  {DIM}{arg}{OFF}");
+    }
+    if let Some(rest) = t.strip_prefix("⏺ ") {
+        let (name, arg) = rest.split_once("  ").unwrap_or((rest, ""));
+        return format!("{pad}{ACCENT}⏺{OFF} {BOLD}{name}{OFF}  {DIM}{arg}{OFF}");
+    }
+    if t.starts_with("jev →") || t.starts_with("plan →") {
+        let lit = t.replacen("needle only · no LLM", &format!("{BOLT}needle only · no LLM{DIM}"), 1);
+        let lit = match lit.find("llm: ") {
+            Some(i) => {
+                let end = lit[i..].find(" ·").map_or(lit.len(), |j| i + j);
+                format!("{}{ACCENT}{}{DIM}{}", &lit[..i], &lit[i..end], &lit[end..])
+            }
+            None => lit,
+        };
+        return format!("{pad}{DIM}{lit}{OFF}");
+    }
+    if t.starts_with('✎') {
+        return format!("{pad}{BOLT}{t}{OFF}");
+    }
+    if t.starts_with('↑') || t.starts_with("needle ") {
+        return format!("{pad}\x1b[33m{t}{OFF}");
+    }
+    format!("{DIM}{text}{OFF}")
+}
+
 impl Ui for Screen {
     fn line(&self, text: &str) {
         let mut s = self.state.lock().unwrap();
         pause(&mut s);
-        let color = if text.contains('⚡') || text.trim_start().starts_with("jev") { BOLT } else { DIM };
-        println!("{color}{text}{OFF}");
+        println!("{}", style(text));
         resume(&mut s);
     }
 
@@ -145,23 +176,31 @@ impl Screen {
             s.streamed.clear();
             resume(&mut s);
         }
+        crate::set_interrupted(false);
         let reply = agent.turn(text);
+        crate::set_interrupted(false);
         if let Some(learner) = agent.learner.take() {
             let _ = learner.join(); // so a "learned skill" line lands before the prompt returns
         }
         let mut s = self.state.lock().unwrap();
         s.busy = false;
         pause(&mut s);
-        if !reply.trim().is_empty() && reply != s.streamed {
+        // A one-line reflex result is already on screen as its tool line's preview.
+        let shown = agent.last_tier == "reflex" && reply.trim().lines().count() <= 1;
+        if !shown && !reply.trim().is_empty() && reply != s.streamed {
             // Reflex results and errors are not streamed.
             let mut in_code = false;
             for line in reply.lines() {
                 println!("{}", if agent.last_tier == "reflex" { format!("  {line}") } else { render(line, &mut in_code) });
             }
         }
+        let route = if agent.last_tier == "reflex" {
+            format!("{BOLT}⚡ needle{DIM}")
+        } else {
+            format!("{ACCENT}◆ {}{DIM} {}", agent.last_tier, agent.shared.cfg.spec(&agent.last_tier).map(|s| s.model.as_str()).unwrap_or(""))
+        };
         println!(
-            "{DIM}  {} · system 1 ×{} · system 2 ×{} · context {:.0}% · {:.1}s{OFF}\n",
-            agent.last_tier,
+            "{DIM}  {route} · system 1 ×{} · system 2 ×{} · context {:.0}% · {:.1}s{OFF}\n",
             count(&["jev", "needle", "mirage"]) - fast_before,
             count(&["s2"]) - slow_before,
             agent.context_used * 100.0,
@@ -177,28 +216,39 @@ impl Ui for Plain {
     fn line(&self, text: &str) {
         eprintln!("{text}");
     }
+
+    fn ask(&self, prompt: &str) -> String {
+        eprint!("{prompt}");
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        answer
+    }
 }
 
 // -- the conversation -------------------------------------------------------------------------
 
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 8] = [
     ("/help", "show this"),
     ("/tier", "pin a model tier: /tier fast|main|deep, or /tier auto to let System 1 choose"),
     ("/skills", "list skills and how they have performed"),
     ("/stats", "how much of this session System 1 handled"),
     ("/yolo", "toggle approval prompts"),
     ("/clear", "start a fresh conversation (memory is kept)"),
+    ("/undo", "put files back as they were before Friday's last change"),
     ("/exit", "leave"),
 ];
 
 #[derive(rustyline::Helper, rustyline::Hinter, rustyline::Validator)]
-struct Line;
+struct Line {
+    /// Slash commands, then `/<skill>` for every skill.
+    words: Vec<String>,
+}
 
 impl rustyline::completion::Completer for Line {
     type Candidate = String;
     fn complete(&self, line: &str, pos: usize, _: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> {
         let typed = &line[..pos];
-        let matches = if typed.starts_with('/') { COMMANDS.iter().filter(|c| c.0.starts_with(typed)).map(|c| c.0.to_string()).collect() } else { Vec::new() };
+        let matches = if typed.starts_with('/') && !typed.contains(' ') { self.words.iter().filter(|w| w.starts_with(typed)).cloned().collect() } else { Vec::new() };
         Ok((0, matches))
     }
 }
@@ -238,18 +288,25 @@ fn banner(agent: &Agent) -> Vec<String> {
     ]
 }
 
+/// A yes/no question; anything but y is no.
+pub fn confirm(question: &str) -> bool {
+    prompt(&format!("  \x1b[33m{question} [y/N]\x1b[0m ")).eq_ignore_ascii_case("y")
+}
+
 pub fn show_skills(cfg: &Config) {
     let (all, marks) = (skills::load(cfg), skills::scores(cfg));
     if all.is_empty() {
         return println!("{DIM}  no skills yet; Friday writes them as it works{OFF}");
     }
-    println!("{DIM}  {:28} {:>4} {:>4}  when{OFF}", "skill", "used", "won");
+    println!("{DIM}  {:28} {:8} {:>9}  when{OFF}", "skill", "from", "record");
     for (name, skill) in all {
         let (uses, wins) = marks.get(&name).copied().unwrap_or_default();
+        let record = if uses == 0 { "—".to_string() } else { format!("{wins}/{uses}") };
         let state = if skills::healthy(marks.get(&name)) { "" } else { "\x1b[31mretired\x1b[0m " };
-        let when: String = skill.description.chars().take(64).collect();
-        println!("  {ACCENT}{name:28}{OFF} {uses:>4} {wins:>4}  {state}{DIM}{when}{OFF}");
+        let when: String = skill.description.chars().take(60).collect();
+        println!("  {ACCENT}{name:28}{OFF} {DIM}{:8}{OFF} {record:>9}  {state}{DIM}{when}{OFF}", skill.origin());
     }
+    println!("{DIM}  /<skill> runs a turn with that skill · friday skills add <git-url> installs a pack{OFF}");
 }
 
 fn show_stats(agent: &Agent) {
@@ -267,11 +324,34 @@ fn show_stats(agent: &Agent) {
     }
 }
 
+fn session_path(agent: &Agent) -> std::path::PathBuf {
+    agent.shared.cfg.home.join("sessions").join(format!("{}.json", agent.name))
+}
+
+/// The conversation so far, so `friday --continue` can pick it up.
+fn save_session(agent: &Agent) {
+    let path = session_path(agent);
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let _ = std::fs::write(path.with_extension("tmp"), serde_json::to_string(&agent.messages).unwrap_or_default());
+    let _ = std::fs::rename(path.with_extension("tmp"), path);
+}
+
+pub fn load_session(agent: &Agent) -> Vec<Value> {
+    let messages: Vec<Value> = std::fs::read_to_string(session_path(agent)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    println!("{DIM}  continuing: {} earlier messages{OFF}", messages.len());
+    messages
+}
+
 pub fn chat_loop(agent: &mut Agent, screen: &Screen, animate: bool) -> Result<()> {
-    coin::spin(&banner(agent), if animate { 1.7 } else { 0.0 });
+    match std::fs::read_to_string(agent.shared.cfg.home.join("logo.txt")) {
+        Ok(logo) => coin::reveal(&logo.lines().map(String::from).collect::<Vec<_>>(), &banner(agent), animate),
+        Err(_) => coin::spin(&banner(agent), if animate { 1.7 } else { 0.0 }),
+    }
     println!();
     let mut editor = rustyline::Editor::<Line, rustyline::history::DefaultHistory>::new()?;
-    editor.set_helper(Some(Line));
+    let mut words: Vec<String> = COMMANDS.iter().map(|c| c.0.to_string()).collect();
+    words.extend(skills::load(&agent.shared.cfg).into_keys().map(|n| format!("/{n}")));
+    editor.set_helper(Some(Line { words }));
     let history = agent.shared.cfg.home.join("history");
     let _ = editor.load_history(&history);
     loop {
@@ -300,9 +380,19 @@ pub fn chat_loop(agent: &mut Agent, screen: &Screen, animate: bool) -> Result<()
                 println!("{DIM}  approvals {}{OFF}", if on { "off" } else { "on" });
             }
             "/clear" => agent.messages.clear(),
-            _ if command.starts_with('/') => println!("{DIM}  unknown command; /help lists them{OFF}"),
+            "/undo" => match crate::checkpoint::undo(&agent.shared.cfg.home, &std::env::current_dir().unwrap_or_default()) {
+                Ok(summary) => println!("{DIM}  {summary}{OFF}"),
+                Err(e) => println!("{DIM}  {e:#}{OFF}"),
+            },
+            _ if command.starts_with('/') && skills::load(&agent.shared.cfg).contains_key(&command[1..]) => {
+                agent.force_skills = vec![command[1..].to_string()];
+                let task = if arg.is_empty() { format!("Use the `{}` skill.", &command[1..]) } else { arg.to_string() };
+                screen.turn(agent, &task);
+            }
+            _ if command.starts_with('/') => println!("{DIM}  unknown command; /help lists them, /skills lists skills{OFF}"),
             _ => screen.turn(agent, &text),
         }
+        save_session(agent);
     }
     let _ = editor.save_history(&history);
     Ok(())

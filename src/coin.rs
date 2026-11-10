@@ -118,3 +118,63 @@ pub fn spin(beside: &[String], seconds: f64) {
     }
     let _ = stdout.flush();
 }
+
+/// Show a custom logo (lines of coloured text) beside `beside`, drawn in top to bottom.
+pub fn reveal(logo: &[String], beside: &[String], animate: bool) {
+    let rows = logo.len().max(beside.len());
+    let width = logo.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+    let animate = animate && crossterm::tty::IsTty::is_tty(&std::io::stdout());
+    let mut stdout = std::io::stdout();
+    for i in 0..rows {
+        let art = logo.get(i).map(String::as_str).unwrap_or("");
+        let pad = " ".repeat(width - visible_width(art));
+        let _ = writeln!(stdout, "  {art}\x1b[0m{pad}   {}", beside.get(i).map(String::as_str).unwrap_or(""));
+        if animate {
+            let _ = stdout.flush();
+            std::thread::sleep(std::time::Duration::from_millis(28));
+        }
+    }
+}
+
+/// Width on screen: escape sequences take none.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            chars.by_ref().find(|c| c.is_ascii_alphabetic());
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// An image as terminal art, `rows` lines tall: each cell is two pixels, top and bottom, drawn
+/// with a half block in true colour. Transparent pixels stay transparent.
+pub fn image_to_art(path: &std::path::Path, rows: u32) -> anyhow::Result<Vec<String>> {
+    let img = image::open(path)?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let max_px_h = rows * 2;
+    let max_w = rows * 3; // keep wide logos beside the banner
+    let scale = (max_px_h as f64 / h as f64).min(max_w as f64 / w as f64);
+    let (nw, nh) = (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1));
+    let img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+    let mut lines = Vec::new();
+    for y in (0..nh).step_by(2) {
+        let mut line = String::new();
+        for x in 0..nw {
+            let top = img.get_pixel(x, y);
+            let bottom = if y + 1 < nh { *img.get_pixel(x, y + 1) } else { image::Rgba([0, 0, 0, 0]) };
+            let (t, b) = (top[3] >= 128, bottom[3] >= 128);
+            line.push_str(&match (t, b) {
+                (true, true) => format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", top[0], top[1], top[2], bottom[0], bottom[1], bottom[2]),
+                (true, false) => format!("\x1b[38;2;{};{};{}m▀\x1b[0m", top[0], top[1], top[2]),
+                (false, true) => format!("\x1b[38;2;{};{};{}m▄\x1b[0m", bottom[0], bottom[1], bottom[2]),
+                (false, false) => " ".into(),
+            });
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}

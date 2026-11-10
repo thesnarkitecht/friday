@@ -84,6 +84,8 @@ pub struct Config {
     pub s1: S1Config,
     pub context: ContextConfig,
     pub watch: Vec<Watch>,
+    /// MCP servers to connect at startup.
+    pub mcp: Vec<crate::mcp::McpConfig>,
     /// Where Friday keeps everything: memory, skills, mail, training data.
     #[serde(skip)]
     pub home: PathBuf,
@@ -122,6 +124,22 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join(".friday"))
 }
 
+fn trusted_list(home: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(home.join("trusted")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+pub fn is_trusted(home: &std::path::Path, dir: &std::path::Path) -> bool {
+    trusted_list(home).iter().any(|t| std::path::Path::new(t) == dir)
+}
+
+pub fn trust(home: &std::path::Path, dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(home)?;
+    let mut list = trusted_list(home);
+    list.push(dir.display().to_string());
+    std::fs::write(home.join("trusted"), list.join("\n") + "\n")?;
+    Ok(())
+}
+
 pub fn load() -> Result<Config> {
     let home = home();
     let path = home.join("config.toml");
@@ -139,8 +157,12 @@ pub fn load() -> Result<Config> {
         user_home.join(".claude/skills"),
         user_home.join(".hermes/skills"),
         home.join("skills"),
-        std::env::current_dir().unwrap_or_default().join(".friday/skills"),
     ];
+    // A cloned repo's skills go into the system prompt, so they load only once the folder is trusted.
+    let project = std::env::current_dir().unwrap_or_default();
+    if is_trusted(&home, &project) {
+        cfg.skill_dirs.push(project.join(".friday/skills"));
+    }
     cfg.home = home;
     Ok(cfg)
 }
