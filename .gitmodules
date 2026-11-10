@@ -1,6 +1,0 @@
-[submodule "vendor/mempalace"]
-	path = vendor/mempalace
-	url = https://github.com/thesnarkitecht/mempalace
-[submodule "vendor/honcho"]
-	path = vendor/honcho
-	url = https://github.com/thesnarkitecht/honcho
