@@ -20,7 +20,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 rustyline = { version = "14", features = ["derive"] }
 termimad = "0.30"
-headless_chrome = "1"
+headless_chrome = { version = "1", features = ["fetch"] }  # fetches its own Chromium when none is installed
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Desktop control needs system libraries on Linux (X11/Wayland), so it is opt-in.
