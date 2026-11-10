@@ -1,0 +1,40 @@
+[package]
+name = "friday"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A System-1-first agent harness: fast typed decisions route, gate and act; big models only think when needed."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", features = ["json", "native-certs"] }  # blocking HTTP: no async runtime anywhere
+rusqlite = { version = "0.32", features = ["bundled"] }
+libloading = "0.8"   # the Cactus engine (Needle 3, Mirage) is a C library
+sha2 = "0.10"        # every downloaded engine artifact is checksum-pinned
+zip = { version = "2", default-features = false, features = ["deflate"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+rustyline = { version = "14", features = ["derive"] }
+termimad = "0.30"
+headless_chrome = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Desktop control needs system libraries on Linux (X11/Wayland), so it is opt-in.
+enigo = { version = "0.2", optional = true }
+xcap = { version = "0.0.14", optional = true }
+fastembed = "7.7.0"
+
+[features]
+desktop = ["dep:enigo", "dep:xcap"]
+
+[dev-dependencies]
+tiny_http = "0.12"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
